@@ -20,7 +20,7 @@ def handle_message(cur, chat_id, text):
         return "Hello buddy 👋"
 
     elif text in ["/start", "/help"]:
-        return "Hi! I'm Deadline Buddy 📅\n\nI remember your tasks so you don't have to.\n\n/add <task> – save a task\n/list – see your tasks\n/done <number> – remove a task"
+        return "Hi! I'm Deadline Buddy ⏳\n\nI remember your tasks so you don't have to.\n\n/add <task> – save a task\n/add <task> @ <date> – save with a deadline\n/list – see your tasks\n/done <number> – remove a task"
 
     elif text == "/add":
         return "What should I save? Type it like this:\n/add Chemistry record"
