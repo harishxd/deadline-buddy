@@ -46,15 +46,16 @@ def handle_message(cur, chat_id, text):
     elif text == "/list":
         cur.execute("SELECT task, due FROM tasks WHERE chat_id = %s ORDER BY due NULLS LAST, id", (chat_id,))
         rows = cur.fetchall()
-        if row[1]:
-            reply += f"{count}. {row[0]} — 📅 {row[1].strftime('%a, %d %b')}\n"
-        else:
-            reply += f"{count}. {row[0]}\n"
+        if not rows:
+            return "No tasks yet. Add one with /add"
         reply = "Your tasks:\n"
         count = 0
         for row in rows:
             count += 1
-            reply += f"{count}. {row[1]}\n"
+            if row[1]:
+                reply += f"{count}. {row[0]} — 📅 {row[1].strftime('%a, %d %b')}\n"
+            else:
+                reply += f"{count}. {row[0]}\n"
         return reply
 
     elif text == "/done":
