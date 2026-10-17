@@ -2,3 +2,5 @@ requests
 python-dotenv
 psycopg[binary]
 flask
+dateparser
+tzdata
