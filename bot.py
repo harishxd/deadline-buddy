@@ -1,6 +1,6 @@
 import requests
 import time
-import sqlite3
+import psycopg
 import os
 
 
@@ -11,9 +11,12 @@ TOKEN = os.getenv("BOT_TOKEN")
 URL = f"https://api.telegram.org/bot{TOKEN}/"
 
 offset = 0   # remembers which messages we've already handled
-conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.abspath(__file__)), "tasks.db"))
+print("Connecting to database...")
+conn = psycopg.connect(os.getenv("DATABASE_URL"), connect_timeout=10)
+print("Connected! ✅")
 cur = conn.cursor()
-cur.execute("CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, task TEXT)")
+cur.execute("CREATE TABLE IF NOT EXISTS tasks (id SERIAL PRIMARY KEY, chat_id BIGINT, task TEXT)")
+conn.commit()
 
 print("Bot is running...")
 
@@ -58,12 +61,12 @@ while True:
 
         elif text.startswith("/add "):
             task = text[5:]   # everything after "/add "
-            cur.execute("INSERT INTO tasks (chat_id, task) VALUES (?, ?)", (chat_id, task))
+            cur.execute("INSERT INTO tasks (chat_id, task) VALUES (%s, %s)", (chat_id, task))
             conn.commit()
             reply = "Saved ✅ " + task
 
         elif text == "/list":
-            cur.execute("SELECT id, task FROM tasks WHERE chat_id = ? ORDER BY id", (chat_id,))
+            cur.execute("SELECT id, task FROM tasks WHERE chat_id = %s ORDER BY id", (chat_id,))
             rows = cur.fetchall()
             if rows:
                 reply = "Your tasks:\n"
@@ -78,11 +81,11 @@ while True:
 
         elif text.startswith("/done "):
             num_text = text[6:]
-            cur.execute("SELECT id FROM tasks WHERE chat_id = ? ORDER BY id", (chat_id,))
+            cur.execute("SELECT id FROM tasks WHERE chat_id = %s ORDER BY id", (chat_id,))
             rows = cur.fetchall()
             if num_text.isdigit() and 1 <= int(num_text) <= len(rows):
                 real_id = rows[int(num_text) - 1][0]
-                cur.execute("DELETE FROM tasks WHERE id = ?", (real_id,))
+                cur.execute("DELETE FROM tasks WHERE id = %s", (real_id,))
                 conn.commit()
                 reply = "Deleted 🗑️"
             else:
