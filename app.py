@@ -2,7 +2,7 @@ import os
 import requests
 import psycopg
 import dateparser
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from flask import Flask, request
 from dotenv import load_dotenv
@@ -26,7 +26,7 @@ def handle_message(cur, chat_id, text):
         return "Hello buddy 👋"
 
     elif text in ["/start", "/help"]:
-        return "Hi! I'm Deadline Buddy ⏳\n\nI remember your tasks so you don't have to.\n\n/add <task> – save a task \n/doneall – clear all tasks\n/add <task> @ <date> – save with a deadline\n/list – see your tasks\n/done <number> – remove a task"
+        return "Hi! I'm Deadline Buddy ⏳\n\nI remember your tasks so you don't have to.\n\n/add <task> – save a task\n/add <task> @ <date> – save with a deadline\n/list – see your tasks\n/done <number> – remove a task\n/doneall – clear all tasks"
 
     elif text == "/add":
         return "What should I save? Type it like this:\n/add Physics test @ 25 Oct"
@@ -63,6 +63,7 @@ def handle_message(cur, chat_id, text):
             else:
                 reply += f"{count}. {row[0]}\n"
         return reply
+
     elif text == "/doneall":
         cur.execute("SELECT COUNT(*) FROM tasks WHERE chat_id = %s", (chat_id,))
         total = cur.fetchone()[0]
@@ -73,6 +74,7 @@ def handle_message(cur, chat_id, text):
     elif text == "/doneall yes":
         cur.execute("DELETE FROM tasks WHERE chat_id = %s", (chat_id,))
         return f"Cleared 🧹 {cur.rowcount} tasks deleted."
+
     elif text == "/done":
         return "What should I delete? Type it like this:\n/done 2"
 
@@ -118,3 +120,35 @@ def webhook():
         print("Couldn't send reply")
 
     return "ok"
+
+@app.route("/cron/daily")
+def daily_reminder():
+    secret = os.getenv("CRON_SECRET")
+    if not secret or request.headers.get("Authorization") != f"Bearer {secret}":
+        return "Not allowed", 401
+
+    today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+
+    with psycopg.connect(os.getenv("DATABASE_URL"), connect_timeout=10) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT chat_id, task, due FROM tasks WHERE due <= %s ORDER BY chat_id, due, id", (today + timedelta(days=1),))
+        rows = cur.fetchall()
+
+    messages = {}
+    for chat_id, task, due in rows:
+        if due < today:
+            label = "⚠️ Overdue"
+        elif due == today:
+            label = "🔥 Today"
+        else:
+            label = "⏰ Tomorrow"
+        messages.setdefault(chat_id, []).append(f"{label}: {task}")
+
+    for chat_id, lines in messages.items():
+        text = "Good morning! ☀️ Here's what's due:\n\n" + "\n".join(lines)
+        try:
+            requests.get(URL + "sendMessage", params={"chat_id": chat_id, "text": text}, timeout=10)
+        except Exception:
+            print("Couldn't send to", chat_id)
+
+    return f"Sent {len(messages)} reminders"
