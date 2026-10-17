@@ -15,6 +15,12 @@ URL = f"https://api.telegram.org/bot{TOKEN}/"
 app = Flask(__name__)
 
 
+def nice_date(d):
+    if d.year == datetime.now(ZoneInfo("Asia/Kolkata")).year:
+        return d.strftime('%a, %d %b')
+    return d.strftime('%a, %d %b %Y')
+
+
 def handle_message(cur, chat_id, text):
     if text.lower() == "hi":
         return "Hello buddy 👋"
@@ -23,7 +29,7 @@ def handle_message(cur, chat_id, text):
         return "Hi! I'm Deadline Buddy ⏳\n\nI remember your tasks so you don't have to.\n\n/add <task> – save a task\n/add <task> @ <date> – save with a deadline\n/list – see your tasks\n/done <number> – remove a task"
 
     elif text == "/add":
-        return "What should I save? Type it like this:\n/add Chemistry record"
+        return "What should I save? Type it like this:\n/add Physics test @ 25 Oct"
 
     elif text.startswith("/add "):
         task, _, date_text = text[5:].partition("@")
@@ -40,7 +46,7 @@ def handle_message(cur, chat_id, text):
             due = parsed.date()
         cur.execute("INSERT INTO tasks (chat_id, task, due) VALUES (%s, %s, %s)", (chat_id, task, due))
         if due:
-            return f"Saved ✅ {task}\n📅 Due {due.strftime('%a, %d %b')}"
+            return f"Saved ✅ {task}\n📅 Due {nice_date(due)}"
         return "Saved ✅ " + task
 
     elif text == "/list":
@@ -53,7 +59,7 @@ def handle_message(cur, chat_id, text):
         for row in rows:
             count += 1
             if row[1]:
-                reply += f"{count}. {row[0]} — 📅 {row[1].strftime('%a, %d %b')}\n"
+                reply += f"{count}. {row[0]} — 📅 {nice_date(row[1])}\n"
             else:
                 reply += f"{count}. {row[0]}\n"
         return reply
