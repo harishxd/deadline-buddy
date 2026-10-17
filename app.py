@@ -74,6 +74,7 @@ def webhook():
     with psycopg.connect(os.getenv("DATABASE_URL"), connect_timeout=10) as conn:
         cur = conn.cursor()
         cur.execute("CREATE TABLE IF NOT EXISTS tasks (id SERIAL PRIMARY KEY, chat_id BIGINT, task TEXT)")
+        cur.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS due DATE")
         reply = handle_message(cur, chat_id, text)
         conn.commit()
 
