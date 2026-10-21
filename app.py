@@ -27,6 +27,7 @@ def handle_message(cur, chat_id, text):
 
     elif text in ["/start", "/help"]:
         return "Hi! I'm Deadline Buddy ⏳\n\nI remember your tasks so you don't have to.\n\n/add <task> – save a task\n/add <task> @ <date> – save with a deadline\n/list – see your tasks\n/done <number> – remove a task\n/doneall – clear all tasks\n\n☀️ Every morning I'll remind you what's overdue, due today and due tomorrow."
+
     elif text == "/add":
         return "What should I save? Type it like this:\n/add Physics test @ 25 Oct"
 
@@ -61,7 +62,7 @@ def handle_message(cur, chat_id, text):
                 reply += f"{count}. {row[0]} — 📅 {nice_date(row[1])}\n"
             else:
                 reply += f"{count}. {row[0]}\n"
-        return reply
+        return reply, [[{"text": "✅ Test", "callback_data": "test"}]]
 
     elif text == "/doneall":
         cur.execute("SELECT COUNT(*) FROM tasks WHERE chat_id = %s", (chat_id,))
@@ -113,12 +114,21 @@ def webhook():
         reply = handle_message(cur, chat_id, text)
         conn.commit()
 
+    markup = None
+    if isinstance(reply, tuple):
+        reply, markup = reply
+
+    data = {"chat_id": chat_id, "text": reply}
+    if markup:
+        data["reply_markup"] = {"inline_keyboard": markup}
+
     try:
-        requests.get(URL + "sendMessage", params={"chat_id": chat_id, "text": reply}, timeout=10)
+        requests.post(URL + "sendMessage", json=data, timeout=10)
     except Exception:
         print("Couldn't send reply")
 
     return "ok"
+
 
 @app.route("/cron/daily")
 def daily_reminder():
