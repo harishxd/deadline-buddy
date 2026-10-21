@@ -12,6 +12,7 @@ from flask import Flask, request, g, jsonify, Response
 from dotenv import load_dotenv
 from dates import extract_when, day_for_time, clean
 from icsfeed import make_ics
+import gsync
 
 load_dotenv()
 
@@ -22,6 +23,10 @@ URL = f"https://api.telegram.org/bot{TOKEN}/"
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 # Where the bot lives on the internet. Used to build calendar links.
 BASE_URL = os.getenv("BASE_URL", "https://deadline-buddy-one.vercel.app")
+# Only this chat gets two-way Google Calendar sync (/connect). Everyone else uses the .ics link.
+OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID")
+# Where Google sends you back after you press Allow. Must match the Google Cloud settings exactly.
+OAUTH_REDIRECT = os.getenv("OAUTH_REDIRECT_URI", f"{BASE_URL}/oauth/callback")
 
 # Local testing: with DRY_RUN=1 we don't call Telegram at all. The calls we
 # *would* make are returned from /webhook so fake_telegram.py can print them.
@@ -67,7 +72,8 @@ HELP_TEXT = (
 def safe(text):
     """Hide secrets before anything gets printed to the logs."""
     text = str(text)
-    for secret in (TOKEN, os.getenv("DATABASE_URL"), os.getenv("CRON_SECRET"), WEBHOOK_SECRET):
+    for secret in (TOKEN, os.getenv("DATABASE_URL"), os.getenv("CRON_SECRET"), WEBHOOK_SECRET,
+                   os.getenv("GOOGLE_CLIENT_SECRET")):
         if secret:
             text = text.replace(secret, "***")
     return text
@@ -110,12 +116,59 @@ def connect():
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS cal_token TEXT")
             cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_cal_token_idx ON users (cal_token)")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS editing_task_id INTEGER")
+            # Google sync (owner only): which event belongs to which task, and the saved sign-in.
+            cur.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS gcal_event_id TEXT")
+            cur.execute("CREATE TABLE IF NOT EXISTS google_accounts (chat_id BIGINT PRIMARY KEY, "
+                        "refresh_token TEXT, access_token TEXT, access_expires TIMESTAMPTZ, calendar_id TEXT, "
+                        "sync_token TEXT, oauth_state TEXT, oauth_state_at TIMESTAMPTZ)")
             conn.commit()
         except Exception:
             conn.close()
             raise
         _db_ready = True
     return conn
+
+
+def is_owner(chat_id):
+    return bool(OWNER_CHAT_ID) and str(chat_id) == OWNER_CHAT_ID.strip()
+
+
+def google_safely(cur, what, fn, *args):
+    """Run a Google sync step without ever breaking the bot.
+
+    conn.transaction() inside a transaction makes a "savepoint": if this step crashes,
+    only its own database changes are undone, and the task change itself still saves."""
+    try:
+        with cur.connection.transaction():
+            fn(cur, *args)
+    except Exception:
+        print(f"Google {what} failed:", safe(traceback.format_exc()))
+
+
+def start_sync(cur, chat_id):
+    """For the owner, if connected: remember the Google account for this request
+    and first pull any changes made in Google Calendar."""
+    g.gacct = None
+    if not is_owner(chat_id):
+        return
+    acct = gsync.load_account(cur, chat_id)
+    if acct:
+        g.gacct = acct
+        google_safely(cur, "pull", gsync.pull, acct)
+
+
+def sync_task(cur, task_id):
+    """A task was added or changed: update Google too (owner only)."""
+    if g.get("gacct"):
+        google_safely(cur, "push", gsync.push_task, g.gacct, task_id)
+
+
+def sync_deleted(cur, event_ids):
+    """Tasks were deleted: delete their Google events too (owner only)."""
+    if g.get("gacct"):
+        for event_id in event_ids:
+            if event_id:
+                google_safely(cur, "delete", gsync.delete_event, g.gacct, event_id)
 
 
 def save_user(cur, chat_id, first_name):
@@ -205,7 +258,9 @@ def insert_task(cur, chat_id, task, due, due_time):
     # RETURNING id gives us the new row's id, so the Undo button knows what to delete.
     cur.execute("INSERT INTO tasks (chat_id, task, due, due_time) VALUES (%s, %s, %s, %s) RETURNING id",
                 (chat_id, task, due, due_time))
-    return cur.fetchone()[0]
+    task_id = cur.fetchone()[0]
+    sync_task(cur, task_id)
+    return task_id
 
 
 def add_task(cur, chat_id, text):
@@ -295,6 +350,7 @@ def edit_task(cur, chat_id, task_id, text):
 
     cur.execute("UPDATE tasks SET task = %s, due = %s, due_time = %s WHERE id = %s AND chat_id = %s",
                 (task, due, due_time, task_id, chat_id))
+    sync_task(cur, task_id)
     reply = f"Updated ✏️ {task}"
     if due:
         reply += f"\n📅 {nice_when(due, due_time)}"
@@ -372,7 +428,49 @@ def calendar_message(cur, chat_id, reset):
         "changes every few hours, so new tasks can take a while to appear.\n\n"
         "🔒 Anyone with this link can see your tasks. If you shared it by "
         "mistake, send /calendar reset to get a new one."
+    ) + owner_sync_status(chat_id)
+
+
+def owner_sync_status(chat_id):
+    if not is_owner(chat_id):
+        return ""
+    if g.get("gacct"):
+        return "\n\n🔁 Two-way Google sync is ON (the \"Deadline Buddy\" calendar). /sync to force a sync, /disconnect to stop."
+    return "\n\n🔁 Two-way Google sync is off. Send /connect to turn it on."
+
+
+def connect_message(cur, chat_id):
+    """Owner only: send a Google sign-in button."""
+    if not os.getenv("GOOGLE_CLIENT_ID") or not os.getenv("GOOGLE_CLIENT_SECRET"):
+        return "Google isn't set up yet (GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET are missing)."
+    # A random one-time code. Google hands it back to /oauth/callback, which proves the
+    # sign-in was started here and not by someone else.
+    state = secrets.token_urlsafe(24)
+    cur.execute("INSERT INTO google_accounts (chat_id, oauth_state, oauth_state_at) VALUES (%s, %s, now()) "
+                "ON CONFLICT (chat_id) DO UPDATE SET oauth_state = EXCLUDED.oauth_state, oauth_state_at = now()",
+                (chat_id, state))
+    again = "You're already connected. Signing in again just refreshes it.\n\n" if g.get("gacct") else ""
+    text = (
+        f"{again}🔐 Tap the button, choose your Google account and press Allow.\n\n"
+        "You'll see \"Google hasn't verified this app\". That's expected, it's your own app: "
+        "tap Advanced → Go to Deadline Buddy.\n\n"
+        "Make sure the calendar box is ticked. The button works for 15 minutes."
     )
+    # A "url" button opens a link instead of sending callback_data.
+    return text, [[{"text": "🔐 Sign in with Google", "url": gsync.sign_in_link(state, OAUTH_REDIRECT)}]]
+
+
+def disconnect(cur, chat_id):
+    acct = gsync.load_account(cur, chat_id)
+    if acct is None:
+        return "Google sync isn't on."
+    gsync.revoke(acct["refresh_token"])
+    cur.execute("DELETE FROM google_accounts WHERE chat_id = %s", (chat_id,))
+    cur.execute("UPDATE tasks SET gcal_event_id = NULL WHERE chat_id = %s", (chat_id,))
+    g.gacct = None
+    return ("🔌 Google sync is off. Your tasks are still here.\n\n"
+            "The \"Deadline Buddy\" calendar is still in Google Calendar. To remove it: "
+            "Google Calendar → Settings → Deadline Buddy → Remove calendar.")
 
 
 def handle_message(cur, chat_id, text, editing_id=None):
@@ -414,8 +512,10 @@ def handle_message(cur, chat_id, text, editing_id=None):
         return f"⚠️ This will delete all {total} of your tasks.\nSend /doneall yes to confirm."
 
     elif text == "/doneall yes":
-        cur.execute("DELETE FROM tasks WHERE chat_id = %s", (chat_id,))
-        return f"Cleared 🧹 {cur.rowcount} tasks deleted."
+        cur.execute("DELETE FROM tasks WHERE chat_id = %s RETURNING gcal_event_id", (chat_id,))
+        deleted = cur.fetchall()
+        sync_deleted(cur, [row[0] for row in deleted])
+        return f"Cleared 🧹 {len(deleted)} tasks deleted."
 
     elif text == "/done":
         return "What should I delete? Type it like this:\n/done 2"
@@ -426,7 +526,8 @@ def handle_message(cur, chat_id, text, editing_id=None):
         rows = cur.fetchall()
         if num_text.isdigit() and 1 <= int(num_text) <= len(rows):
             real_id = rows[int(num_text) - 1][0]
-            cur.execute("DELETE FROM tasks WHERE id = %s AND chat_id = %s", (real_id, chat_id))
+            cur.execute("DELETE FROM tasks WHERE id = %s AND chat_id = %s RETURNING gcal_event_id", (real_id, chat_id))
+            sync_deleted(cur, [row[0] for row in cur.fetchall()])
             return "Deleted 🗑️"
         return "No task with that number 🤔"
 
@@ -443,6 +544,19 @@ def handle_message(cur, chat_id, text, editing_id=None):
 
     elif text == "/cancel":
         return "Nothing to cancel 🙂"
+
+    # Owner-only. For anyone else these fall through to "I don't know that command".
+    elif text == "/connect" and is_owner(chat_id):
+        return connect_message(cur, chat_id)
+
+    elif text == "/sync" and is_owner(chat_id):
+        if not g.get("gacct"):
+            return "Google sync isn't on. Send /connect first."
+        google_safely(cur, "full sync", gsync.push_unsynced, g.gacct, True)
+        return "🔄 Synced with Google Calendar."
+
+    elif text == "/disconnect" and is_owner(chat_id):
+        return disconnect(cur, chat_id)
 
     elif text.startswith("/"):
         return "I don't know that command 🤔 Tap ❓ Help to see what I can do."
@@ -463,11 +577,13 @@ def handle_callback(cur, chat_id, data):
         # "undo:61-64" = the "Undo all" button after saving several lines at once
         first, _, last = task_id.partition("-")
         if first.isdigit() and last.isdigit() and 0 <= int(last) - int(first) <= 100:
-            cur.execute("DELETE FROM tasks WHERE id BETWEEN %s AND %s AND chat_id = %s",
+            cur.execute("DELETE FROM tasks WHERE id BETWEEN %s AND %s AND chat_id = %s RETURNING gcal_event_id",
                         (int(first), int(last), chat_id))
-            if cur.rowcount == 0:
+            deleted = cur.fetchall()
+            if not deleted:
                 return "Already removed", None, None, None
-            return "Undone ↩️", f"↩️ Removed {cur.rowcount} tasks.", None, None
+            sync_deleted(cur, [row[0] for row in deleted])
+            return "Undone ↩️", f"↩️ Removed {len(deleted)} tasks.", None, None
 
     if not task_id.isdigit():
         return "This button is old. Send /list again 🙂", None, None, None
@@ -475,10 +591,11 @@ def handle_callback(cur, chat_id, data):
 
     if action == "undo":
         # chat_id in the WHERE means you can only ever delete your own task.
-        cur.execute("DELETE FROM tasks WHERE id = %s AND chat_id = %s RETURNING task", (task_id, chat_id))
+        cur.execute("DELETE FROM tasks WHERE id = %s AND chat_id = %s RETURNING task, gcal_event_id", (task_id, chat_id))
         row = cur.fetchone()
         if row is None:
             return "Already removed", None, None, None
+        sync_deleted(cur, [row[1]])
         return "Undone ↩️", f"↩️ Removed: {row[0]}", None, None
 
     if action == "edit":
@@ -488,9 +605,11 @@ def handle_callback(cur, chat_id, data):
         return "Editing ✏️", None, None, instructions
 
     if action in ("done", "rdone"):
-        cur.execute("DELETE FROM tasks WHERE id = %s AND chat_id = %s RETURNING task", (task_id, chat_id))
+        cur.execute("DELETE FROM tasks WHERE id = %s AND chat_id = %s RETURNING task, gcal_event_id", (task_id, chat_id))
         row = cur.fetchone()
         popup = f"Done ✅ {short(row[0])}" if row else "Already done"
+        if row:
+            sync_deleted(cur, [row[1]])
 
         if action == "done":
             # Tapped on the task list: show the list again, minus that task.
@@ -510,6 +629,14 @@ def handle_callback(cur, chat_id, data):
     return "This button is old. Send /list again 🙂", None, None, None
 
 
+def warn_if_sync_broke(chat_id):
+    """If Google refused our saved sign-in (access removed, or expired), tell the owner once."""
+    acct = g.get("gacct")
+    if acct and acct.get("broken"):
+        tg("sendMessage", chat_id=chat_id,
+           text="⚠️ Google Calendar sync stopped: Google no longer accepts the sign-in. Send /connect to turn it back on.")
+
+
 def on_message(message):
     chat_id = message["chat"]["id"]
     text = message["text"].strip()
@@ -518,8 +645,10 @@ def on_message(message):
     with connect() as conn:
         cur = conn.cursor()
         editing_id = save_user(cur, chat_id, first_name)
+        start_sync(cur, chat_id)
         reply = handle_message(cur, chat_id, text, editing_id)
         conn.commit()
+    warn_if_sync_broke(chat_id)
 
     markup = None
     if isinstance(reply, tuple):
@@ -544,8 +673,10 @@ def on_callback(cq):
     with connect() as conn:
         cur = conn.cursor()
         save_user(cur, chat_id, cq["from"].get("first_name"))
+        start_sync(cur, chat_id)
         popup, new_text, buttons, new_message = handle_callback(cur, chat_id, data)
         conn.commit()
+    warn_if_sync_broke(chat_id)
 
     # Always answer, or the button shows a loading spinner for a long time.
     tg("answerCallbackQuery", callback_query_id=cq["id"], text=popup)
@@ -627,6 +758,60 @@ def webhook():
     return "ok"
 
 
+def small_page(title, text, status=200):
+    html = (f"<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, "
+            f"initial-scale=1'><title>{title}</title><style>body{{font-family:system-ui,sans-serif;max-width:480px;"
+            f"margin:3rem auto;padding:0 1rem;line-height:1.6}}</style></head><body><h1>{title}</h1><p>{text}</p></body></html>")
+    return Response(html, status=status, mimetype="text/html")
+
+
+@app.route("/oauth/callback")
+def oauth_callback():
+    """Google sends the owner's browser here after they press Allow (or Cancel)."""
+    if request.args.get("error"):
+        return small_page("Not connected", "Google sign-in was cancelled. Send /connect in Telegram to try again.", 400)
+    state, code = request.args.get("state", ""), request.args.get("code", "")
+
+    with connect() as conn:
+        cur = conn.cursor()
+        # The state must be one we made in the last 15 minutes, for the owner. Then it's used up.
+        cur.execute("SELECT chat_id FROM google_accounts WHERE oauth_state = %s "
+                    "AND oauth_state_at > now() - interval '15 minutes'", (state,))
+        row = cur.fetchone()
+        if not state or not code or row is None or not is_owner(row[0]):
+            return small_page("Link expired", "This sign-in link is old or not valid. Send /connect in Telegram again.", 400)
+        chat_id = row[0]
+        cur.execute("UPDATE google_accounts SET oauth_state = NULL WHERE chat_id = %s", (chat_id,))
+        conn.commit()
+
+        tokens = gsync.exchange_code(code, OAUTH_REDIRECT)
+        if not tokens or not tokens.get("refresh_token"):
+            return small_page("Something went wrong", "Google didn't give the bot access. Send /connect and try again.", 500)
+        if gsync.SCOPE not in tokens.get("scope", "").split():
+            gsync.revoke(tokens["refresh_token"])
+            return small_page("Calendar box not ticked",
+                              "The bot needs the calendar permission. Send /connect again and tick the calendar box.", 400)
+        try:
+            with conn.transaction():
+                count = gsync.finish_connect(cur, chat_id, tokens)
+        except Exception:
+            print("Finishing Google connect failed:", safe(traceback.format_exc()))
+            count = None
+        conn.commit()
+
+    if count is None:
+        tg("sendMessage", chat_id=chat_id, text="⚠️ Signed in, but I couldn't create the calendar. Try /connect again.")
+        return small_page("Almost", "Signed in, but creating the calendar failed. Send /connect in Telegram to retry.", 500)
+    tg("sendMessage", chat_id=chat_id, reply_markup=MAIN_KEYBOARD, text=(
+        "✅ Google Calendar connected!\n\n"
+        f"I made a calendar called \"Deadline Buddy\" and put {count} task(s) in it.\n"
+        "• Add, edit or ✅ here → it changes in Google right away\n"
+        "• Move, rename or delete an event there → I pick it up next time you message me\n"
+        "• Timed tasks get a phone alert 30 minutes before\n\n"
+        "Tip: remove the old 📅 link subscription from Google Calendar, or you'll see every task twice."))
+    return small_page("Connected ✅", "Google Calendar is connected. You can close this tab and go back to Telegram.")
+
+
 @app.route("/cal/<token>.ics")
 def calendar_feed(token):
     # Google Calendar fetches this URL every few hours. The token is the only
@@ -659,6 +844,12 @@ def daily_reminder():
 
     with connect() as conn:
         cur = conn.cursor()
+        if OWNER_CHAT_ID:
+            # Catch up with Google first (so the reminder is right), and retry anything that failed to push.
+            start_sync(cur, int(OWNER_CHAT_ID))
+            if g.get("gacct"):
+                google_safely(cur, "catch-up push", gsync.push_unsynced, g.gacct)
+            conn.commit()
         cur.execute("SELECT chat_id, id, task, due, due_time FROM tasks WHERE due <= %s "
                     "ORDER BY chat_id, due, due_time NULLS FIRST, id", (today + timedelta(days=1),))
         rows = cur.fetchall()

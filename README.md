@@ -23,6 +23,12 @@ Open it in Telegram, then just type what you need to do.
   Calendar (Other calendars → + → From URL) and tasks **with a date** show up (all-day,
   or at their time). Tasks without a date stay in the bot only. `/calendar reset`
   makes a new link if you leaked the old one.
+- **Two-way Google sync (owner only).** The owner can `/connect` their Google account.
+  The bot then keeps its own "Deadline Buddy" calendar in sync both ways: changes in the
+  bot show up in Google right away, and events moved, renamed, deleted or added in that
+  calendar come back into the bot. Timed tasks get a phone alert 30 minutes before. It
+  uses the `calendar.app.created` scope, so the bot can't see or touch any other calendar.
+  Owner commands: `/connect`, `/sync`, `/disconnect`.
 - **Private.** Every query filters by your chat id, so you only ever see or change
   your own tasks.
 
@@ -42,6 +48,8 @@ Vercel cron (00:00 UTC) ──GET /cron/daily──▶ Vercel ──▶ Telegram
 | `app.py` | The Flask app: webhook, buttons, commands, calendar feed, morning cron |
 | `dates.py` | Finds a date and time inside a sentence (`extract_when`) |
 | `icsfeed.py` | Builds the `.ics` calendar text (`make_ics`) |
+| `gsync.py` | Owner's two-way Google Calendar sync (OAuth sign-in, push, pull) |
+| `test_gsync.py` | Tests for the Google event conversion and sign-in link |
 | `test_dates.py` | 47 example sentences for the date and time finder |
 | `test_ics.py` | Checks the calendar feed is valid, using the `icalendar` package |
 | `fake_telegram.py` | Pretends to be Telegram for local testing |
@@ -49,8 +57,9 @@ Vercel cron (00:00 UTC) ──GET /cron/daily──▶ Vercel ──▶ Telegram
 
 Database tables:
 
-- `tasks(id, chat_id, task, due, due_time)`
+- `tasks(id, chat_id, task, due, due_time, gcal_event_id)`
 - `users(chat_id, first_name, created_at, cal_token, editing_task_id)`
+- `google_accounts(chat_id, refresh_token, access_token, access_expires, calendar_id, sync_token, oauth_state, oauth_state_at)`
 
 Tables are created automatically (`CREATE TABLE IF NOT EXISTS`) the first time the
 app connects.
@@ -63,6 +72,7 @@ app connects.
 pip install -r requirements.txt -r requirements-dev.txt
 python test_dates.py
 python test_ics.py
+python test_gsync.py
 
 # Terminal 1: start the bot. DRY_RUN=1 means it won't really message Telegram.
 $env:DRY_RUN="1"; flask --app app run
@@ -81,6 +91,10 @@ The local bot uses the real database, but `fake_telegram.py` uses a fake chat id
 `git push` to `main`. Vercel deploys automatically.
 Environment variables in Vercel: `BOT_TOKEN`, `DATABASE_URL`, `CRON_SECRET`,
 `WEBHOOK_SECRET` (optional: `BASE_URL`, defaults to `https://deadline-buddy-one.vercel.app`).
+
+For the owner's Google sync: `OWNER_CHAT_ID` (the owner's Telegram chat id),
+`GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` (a Google Cloud OAuth "Web application"
+client with redirect URI `https://deadline-buddy-one.vercel.app/oauth/callback`).
 
 `WEBHOOK_SECRET` must be the same in `.env`, in Vercel, and in Telegram's webhook
 settings (`setWebhook` with `secret_token`). If you ever change it, update Vercel and
