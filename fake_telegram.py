@@ -11,15 +11,21 @@ Then:
 With DRY_RUN=1 the bot doesn't really message Telegram. It sends back the
 calls it *would* have made, and this script prints them.
 """
+import os
 import sys
 import requests
+from dotenv import load_dotenv
+
+load_dotenv(".env")
 
 CHAT_ID = 999000001  # a fake user, so tests never mix with real friends' tasks
 BOT = "http://127.0.0.1:5000/webhook"
+# Send the webhook secret like real Telegram does, or the bot rejects us.
+HEADERS = {"X-Telegram-Bot-Api-Secret-Token": os.getenv("WEBHOOK_SECRET", "")}
 
 
 def send(update):
-    r = requests.post(BOT, json=update, timeout=30)
+    r = requests.post(BOT, json=update, headers=HEADERS, timeout=30)
     try:
         calls = r.json()
     except ValueError:

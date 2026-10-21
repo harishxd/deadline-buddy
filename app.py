@@ -1,4 +1,5 @@
 import os
+import hmac
 import secrets
 import traceback
 import requests
@@ -15,6 +16,9 @@ load_dotenv()
 
 TOKEN = os.getenv("BOT_TOKEN")
 URL = f"https://api.telegram.org/bot{TOKEN}/"
+# A password only Telegram knows (we give it to Telegram with setWebhook).
+# Every real update carries it, so fake updates from anyone else are rejected.
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 # Where the bot lives on the internet. Used to build calendar links.
 BASE_URL = os.getenv("BASE_URL", "https://deadline-buddy-one.vercel.app")
 
@@ -62,7 +66,7 @@ HELP_TEXT = (
 def safe(text):
     """Hide secrets before anything gets printed to the logs."""
     text = str(text)
-    for secret in (TOKEN, os.getenv("DATABASE_URL"), os.getenv("CRON_SECRET")):
+    for secret in (TOKEN, os.getenv("DATABASE_URL"), os.getenv("CRON_SECRET"), WEBHOOK_SECRET):
         if secret:
             text = text.replace(secret, "***")
     return text
@@ -498,6 +502,13 @@ def home():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    # Only checked once WEBHOOK_SECRET is set, so the bot keeps working while it's being set up.
+    # compare_digest compares safely (it takes the same time whether the guess is close or not).
+    if WEBHOOK_SECRET:
+        sent = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if not hmac.compare_digest(sent, WEBHOOK_SECRET):
+            return "Not allowed", 401
+
     update = request.get_json(silent=True) or {}
 
     # If anything below crashes we still return "ok". Otherwise Telegram keeps

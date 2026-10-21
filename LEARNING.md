@@ -972,9 +972,21 @@ that word to every real update, in a header called `X-Telegram-Bot-Api-Secret-To
 The bot checks it:
 
 ```python
-if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != os.getenv("WEBHOOK_SECRET"):
-    return "Not allowed", 401
+    # Only checked once WEBHOOK_SECRET is set, so the bot keeps working while it's being set up.
+    # compare_digest compares safely (it takes the same time whether the guess is close or not).
+    if WEBHOOK_SECRET:
+        sent = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if not hmac.compare_digest(sent, WEBHOOK_SECRET):
+            return "Not allowed", 401
 ```
+
+Why `hmac.compare_digest` instead of `!=`? A normal `!=` stops at the first wrong
+letter, so a wrong guess that starts correctly takes a tiny bit longer to reject. An
+attacker measuring those tiny delays could guess the secret one letter at a time.
+`compare_digest` always takes the same time.
+
+`fake_telegram.py` reads the same secret from `.env` and sends it in the header, just
+like Telegram does, so local testing keeps working.
 
 Fakers don't know the word, so their updates are thrown away. It's the same idea as
 `CRON_SECRET` on `/cron/daily`, which you already have.
@@ -984,7 +996,7 @@ env var in Vercel, and telling Telegram the word. If the code starts demanding t
 word before Telegram sends it, every **real** message gets rejected and the bot goes
 silent. Safe order:
 
-1. Deploy code that checks the word **only if `WEBHOOK_SECRET` is set**.
+1. Deploy code that checks the word **only if `WEBHOOK_SECRET` is set** (done).
 2. Add `WEBHOOK_SECRET` in Vercel and redeploy.
 3. Call `setWebhook` with the same `secret_token`.
 4. Check `getWebhookInfo` shows no errors.
