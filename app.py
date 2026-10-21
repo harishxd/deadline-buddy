@@ -1,18 +1,22 @@
 import os
+import secrets
 import traceback
 import requests
 import psycopg
 import dateparser
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-from flask import Flask, request, g, jsonify
+from flask import Flask, request, g, jsonify, Response
 from dotenv import load_dotenv
 from dates import extract_date, clean
+from icsfeed import make_ics
 
 load_dotenv()
 
 TOKEN = os.getenv("BOT_TOKEN")
 URL = f"https://api.telegram.org/bot{TOKEN}/"
+# Where the bot lives on the internet. Used to build calendar links.
+BASE_URL = os.getenv("BASE_URL", "https://deadline-buddy-one.vercel.app")
 
 # Local testing: with DRY_RUN=1 we don't call Telegram at all. The calls we
 # *would* make are returned from /webhook so fake_telegram.py can print them.
@@ -204,6 +208,32 @@ def reminder_view(rows, today):
     return "\n".join(lines)[:4000], buttons[:50]
 
 
+def calendar_message(cur, chat_id, reset):
+    """Give the user their private calendar link (make a token the first time)."""
+    # token_urlsafe(16) = 22 random letters/digits. Impossible to guess.
+    new_token = secrets.token_urlsafe(16)
+    if reset:
+        cur.execute("UPDATE users SET cal_token = %s WHERE chat_id = %s", (new_token, chat_id))
+    else:
+        # Only sets a token if the user doesn't have one yet.
+        cur.execute("UPDATE users SET cal_token = %s WHERE chat_id = %s AND cal_token IS NULL", (new_token, chat_id))
+    cur.execute("SELECT cal_token FROM users WHERE chat_id = %s", (chat_id,))
+    link = f"{BASE_URL}/cal/{cur.fetchone()[0]}.ics"
+
+    first = "🔄 New link made. The old one doesn't work anymore.\n\n" if reset else ""
+    return (
+        f"{first}📅 Your private calendar link:\n{link}\n\n"
+        "Add it to Google Calendar (on a computer):\n"
+        "1. Open calendar.google.com\n"
+        "2. On the left, next to \"Other calendars\", click +\n"
+        "3. Choose \"From URL\", paste the link, click \"Add calendar\"\n\n"
+        "Tasks with a date show up as all-day events. Google only checks for "
+        "changes every few hours, so new tasks can take a while to appear.\n\n"
+        "🔒 Anyone with this link can see your tasks. If you shared it by "
+        "mistake, send /calendar reset to get a new one."
+    )
+
+
 def handle_message(cur, chat_id, text):
     if text.lower().strip("!.? ") in GREETINGS:
         return "Hello buddy 👋 Just type a task, like: chem record friday"
@@ -218,7 +248,10 @@ def handle_message(cur, chat_id, text):
         return add_task(cur, chat_id, text[5:])
 
     elif text in ["/calendar", BTN_CAL]:
-        return "Calendar is coming soon 📅"
+        return calendar_message(cur, chat_id, reset=False)
+
+    elif text == "/calendar reset":
+        return calendar_message(cur, chat_id, reset=True)
 
     elif text in ["/list", BTN_LIST]:
         return list_view(cur, chat_id)
@@ -316,7 +349,8 @@ def on_message(message):
         markup = {"inline_keyboard": markup}
     else:
         markup = MAIN_KEYBOARD
-    tg("sendMessage", chat_id=chat_id, text=reply, reply_markup=markup)
+    tg("sendMessage", chat_id=chat_id, text=reply, reply_markup=markup,
+       link_preview_options={"is_disabled": True})
 
 
 def on_callback(cq):
@@ -368,6 +402,28 @@ def webhook():
     if DRY_RUN:
         return jsonify(g.get("sent", []))
     return "ok"
+
+
+@app.route("/cal/<token>.ics")
+def calendar_feed(token):
+    # Google Calendar fetches this URL every few hours. The token is the only
+    # "password", so an unknown token gets a plain 404.
+    if len(token) > 64:
+        return "Not found", 404
+    with connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT chat_id FROM users WHERE cal_token = %s", (token,))
+        user = cur.fetchone()
+        if user is None:
+            return "Not found", 404
+        cur.execute("SELECT id, task, due FROM tasks WHERE chat_id = %s AND due IS NOT NULL ORDER BY due, id", (user[0],))
+        rows = cur.fetchall()
+
+    return Response(
+        make_ics(rows, datetime.now(timezone.utc)),
+        mimetype="text/calendar",
+        headers={"Cache-Control": "no-cache", "Content-Disposition": 'inline; filename="deadline-buddy.ics"'},
+    )
 
 
 @app.route("/cron/daily")
