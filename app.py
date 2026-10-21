@@ -135,11 +135,12 @@ GREETINGS = {"hi", "hii", "hello", "hey", "heyy", "yo", "hola", "namaste", "than
 def add_task(cur, chat_id, text):
     """Save a task typed as normal text, e.g. "chem record friday"."""
     today = india_today()
-    if "@" in text:
+    if " @" in text:
         # Old style: "task @ date". Everything after @ is the date.
-        task, _, date_text = text.partition("@")
+        # (Needs a space before @, so emails like prof@college.edu are left alone.)
+        task, _, date_text = text.partition(" @")
         task = clean(task)
-        leftover, due = extract_date(date_text, today)
+        _, due = extract_date(date_text, today)
         if due is None and date_text.strip():
             # Our patterns didn't know it. Let dateparser have a go ("in 2 months" etc).
             now_india = datetime.now(ZoneInfo("Asia/Kolkata")).replace(tzinfo=None)
