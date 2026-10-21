@@ -1,4 +1,5 @@
 import os
+import re
 import hmac
 import secrets
 import traceback
@@ -160,13 +161,24 @@ def nice_when(due, due_time):
     return text
 
 
-GREETINGS = {"hi", "hii", "hello", "hey", "heyy", "yo", "hola", "namaste", "thanks", "thank you",
+GREETINGS = {"hi", "hello", "hey", "yo", "hola", "namaste", "thanks", "thank you",
              "thx", "ty", "ok", "okay", "k", "cool", "nice", "good morning", "gm", "good night", "gn", "bye"}
 
 
-def add_task(cur, chat_id, text):
-    """Save a task typed as normal text, e.g. "chem record friday"."""
-    now = india_now()
+def squash(text):
+    """Squash repeated letters, so "hellooooo" and "hiii" look like "helo" and "hi"."""
+    return re.sub(r"(.)\1+", r"\1", text)
+
+
+SQUASHED_GREETINGS = {squash(g) for g in GREETINGS}
+
+
+def is_greeting(text):
+    return squash(text.lower().strip("!.? ")) in SQUASHED_GREETINGS
+
+
+def parse_task(text, now):
+    """Split one line into (task, due, due_time). Returns an error message (str) if it can't."""
     if " @" in text:
         # Old style: "task @ date". Everything after @ is the date.
         # (Needs a space before @, so emails like prof@college.edu are left alone.)
@@ -186,17 +198,59 @@ def add_task(cur, chat_id, text):
         return "What's the task? Type it like this:\nchem record friday"
     if due_time and not due:
         due = day_for_time(due_time, now)  # "call mom 5pm" = today (or tomorrow if 5pm passed)
+    return task, due, due_time
 
+
+def insert_task(cur, chat_id, task, due, due_time):
     # RETURNING id gives us the new row's id, so the Undo button knows what to delete.
     cur.execute("INSERT INTO tasks (chat_id, task, due, due_time) VALUES (%s, %s, %s, %s) RETURNING id",
                 (chat_id, task, due, due_time))
-    task_id = cur.fetchone()[0]
+    return cur.fetchone()[0]
+
+
+def add_task(cur, chat_id, text):
+    """Save a task typed as normal text, e.g. "chem record friday"."""
+    parsed = parse_task(text, india_now())
+    if isinstance(parsed, str):
+        return parsed  # an error message
+    task, due, due_time = parsed
+    task_id = insert_task(cur, chat_id, task, due, due_time)
 
     reply = f"Saved ✅ {task}"
     if due:
         reply += f"\n📅 {nice_when(due, due_time)}"
     return reply, [[{"text": "↩️ Undo", "callback_data": f"undo:{task_id}"},
                     {"text": "✏️ Edit", "callback_data": f"edit:{task_id}"}]]
+
+
+def add_tasks(cur, chat_id, text):
+    """A message with several lines = several tasks, one per line."""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(lines) <= 1:
+        return add_task(cur, chat_id, text)
+
+    now = india_now()
+    saved, skipped = [], []
+    for line in lines[:20]:
+        parsed = parse_task(line, now)
+        if isinstance(parsed, str):
+            skipped.append(line)
+            continue
+        saved.append((insert_task(cur, chat_id, *parsed), *parsed))
+    if not saved:
+        return "I couldn't find any tasks in that 🤔"
+
+    reply = f"Saved ✅ {len(saved)} tasks:\n"
+    for _, task, due, due_time in saved:
+        reply += f"\n• {task}" + (f" — 📅 {nice_when(due, due_time)}" if due else "")
+    if skipped:
+        reply += "\n\nSkipped: " + ", ".join(skipped)
+    if len(lines) > 20:
+        reply += "\n\n(Only the first 20 lines were saved.)"
+    # One button undoes them all. The new ids are in one range, and the chat_id
+    # check in the DELETE makes sure only *your* tasks in that range are touched.
+    ids = [row[0] for row in saved]
+    return reply, [[{"text": f"↩️ Undo all {len(saved)}", "callback_data": f"undo:{min(ids)}-{max(ids)}"}]]
 
 
 def start_edit(cur, chat_id, task_id):
@@ -331,7 +385,7 @@ def handle_message(cur, chat_id, text, editing_id=None):
             return edit_task(cur, chat_id, editing_id, text)
         # A command or button: stop editing and do that instead (below).
 
-    if text.lower().strip("!.? ") in GREETINGS:
+    if is_greeting(text):
         return "Hello buddy 👋 Just type a task, like: chem record friday"
 
     elif text in ["/start", "/help", BTN_HELP]:
@@ -340,8 +394,8 @@ def handle_message(cur, chat_id, text, editing_id=None):
     elif text in ["/add", BTN_ADD]:
         return "Just type your task and when it's due 👇\n\nchem record friday\nphysics test 25 oct\nsubmit lab tomorrow"
 
-    elif text.startswith("/add "):
-        return add_task(cur, chat_id, text[5:])
+    elif text.startswith("/add ") or text.startswith("/add\n"):
+        return add_tasks(cur, chat_id, text[5:])
 
     elif text in ["/calendar", BTN_CAL]:
         return calendar_message(cur, chat_id, reset=False)
@@ -394,8 +448,8 @@ def handle_message(cur, chat_id, text, editing_id=None):
         return "I don't know that command 🤔 Tap ❓ Help to see what I can do."
 
     else:
-        # Anything else is a new task.
-        return add_task(cur, chat_id, text)
+        # Anything else is a new task (or several, one per line).
+        return add_tasks(cur, chat_id, text)
 
 
 def handle_callback(cur, chat_id, data):
@@ -404,6 +458,17 @@ def handle_callback(cur, chat_id, data):
     new_message is an extra message to send (or None)."""
     # callback_data looks like "undo:57" -> action "undo", task id 57
     action, _, task_id = data.partition(":")
+
+    if action == "undo" and "-" in task_id:
+        # "undo:61-64" = the "Undo all" button after saving several lines at once
+        first, _, last = task_id.partition("-")
+        if first.isdigit() and last.isdigit() and 0 <= int(last) - int(first) <= 100:
+            cur.execute("DELETE FROM tasks WHERE id BETWEEN %s AND %s AND chat_id = %s",
+                        (int(first), int(last), chat_id))
+            if cur.rowcount == 0:
+                return "Already removed", None, None, None
+            return "Undone ↩️", f"↩️ Removed {cur.rowcount} tasks.", None, None
+
     if not task_id.isdigit():
         return "This button is old. Send /list again 🙂", None, None, None
     task_id = int(task_id)

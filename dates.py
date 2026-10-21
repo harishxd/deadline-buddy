@@ -133,8 +133,9 @@ PATTERNS = [
 ]
 PATTERNS = [(re.compile(p, re.IGNORECASE), fn) for p, fn in PATTERNS]
 
-# Little words that belong to the date, not the task: "submit lab BY friday"
-LEFTOVER = re.compile(r"(?:\b(?:on|by|before|due|till|until|for)|@)\s*$", re.IGNORECASE)
+# Little words that belong to the date, not the task: "submit lab BY friday",
+# "tech shodha AT 30th oct", "fest ON THE 25th oct"
+LEFTOVER = re.compile(r"(?:\b(?:on|by|before|due|till|until|for|at)(?:\s+the)?|@)\s*$", re.IGNORECASE)
 
 
 def extract_date(text, today):

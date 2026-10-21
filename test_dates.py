@@ -28,6 +28,9 @@ CASES = [
     ("pages 10-12 by friday",            "pages 10-12",           date(2026, 10, 23)),
     ("Physics Test on 25th Oct, 2026",   "Physics Test",          date(2026, 10, 25)),
     ("meeting 10:30 tomorrow",           "meeting 10:30",         date(2026, 10, 22)),
+    ("Tech shodha at 30th oct",          "Tech shodha",           date(2026, 10, 30)),  # real message that broke
+    ("fest on the 25th oct",             "fest",                  date(2026, 10, 25)),
+    ("C programming module 2 test on Friday", "C programming module 2 test", date(2026, 10, 23)),
     # A date that already passed this year means next year ("prefer future").
     ("physics test 20 oct",              "physics test",          date(2027, 10, 20)),
     # Normal words and numbers that must NOT become dates:

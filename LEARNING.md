@@ -29,6 +29,7 @@ Contents
 22. [Phase 3: real Google Calendar sync, just for you (not built)](#22-phase-3-real-google-calendar-sync-just-for-you-not-built)
 23. [The webhook secret, explained](#23-the-webhook-secret-explained)
 24. [Ideas for later](#24-ideas-for-later)
+25. [Fixes from real messages](#25-fixes-from-real-messages)
 
 ---
 
@@ -1013,3 +1014,61 @@ Vercel definitely had the same value.
   alerts.)
 - **Repeating tasks** ("gym every monday").
 - **Snooze** a reminder to tomorrow with one tap.
+
+## 25. Fixes from real messages
+
+Tests only check the sentences you thought of. Real people type things you didn't.
+These three came from screenshots of the bot in actual use, and each became a test.
+
+### "Tech shodha at 30th oct" → saved as "Tech shodha at"
+
+The date was found, but `at` was left hanging because it wasn't in the list of
+leftover words. And "on **the** 25th oct" would have left "the". The fix adds `at`,
+and an optional `the` after any of the words:
+
+```python
+LEFTOVER = re.compile(r"(?:\b(?:on|by|before|due|till|until|for|at)(?:\s+the)?|@)\s*$", re.IGNORECASE)
+```
+
+The exact message is now in `test_dates.py`, so this can never quietly come back.
+
+### "hellooooooooooooo" → saved as a task
+
+Greetings were matched exactly, so "hiii" or "hellooo" didn't count. Instead of
+listing every spelling, we **squash** repeated letters on both sides before comparing:
+
+```python
+def squash(text):
+    """Squash repeated letters, so "hellooooo" and "hiii" look like "helo" and "hi"."""
+    return re.sub(r"(.)\1+", r"\1", text)
+```
+
+In regex, `(.)` captures any one character and `\1+` means "that same character again,
+one or more times". So `"hellooooo"` becomes `"helo"`, and `"hello"` in the list also
+becomes `"helo"`. They match.
+
+### Several lines in one message → one long task
+
+People write lists. Now each line is its own task:
+
+```python
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(lines) <= 1:
+        return add_task(cur, chat_id, text)
+```
+
+To do that, the old `add_task` was split into small pieces that can be reused per line:
+`parse_task` (text → task/date/time, or an error message), `insert_task` (save one row),
+and `add_tasks` (loop over lines). Splitting a function so a piece can be reused is
+called **refactoring**: the behaviour for one line stays exactly the same.
+
+One "↩️ Undo all" button removes them together. Its callback_data holds the range of
+new ids, like `undo:61-64`:
+
+```python
+            cur.execute("DELETE FROM tasks WHERE id BETWEEN %s AND %s AND chat_id = %s",
+                        (int(first), int(last), chat_id))
+```
+
+Another person's task could have an id inside that range (if they saved one at the same
+moment), but `AND chat_id = %s` means it's never touched. Same rule as section 14.
