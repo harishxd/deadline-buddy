@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from flask import Flask, request, g, jsonify, Response
 from dotenv import load_dotenv
-from dates import extract_date, clean
+from dates import extract_when, day_for_time, clean
 from icsfeed import make_ics
 
 load_dotenv()
@@ -43,13 +43,15 @@ HELP_TEXT = (
     "Just type a task, like:\n"
     "• chem record friday\n"
     "• physics test 25 oct\n"
-    "• submit lab tomorrow\n\n"
+    "• submit lab tomorrow\n"
+    "• call mom friday 5pm\n\n"
     "Buttons below:\n"
-    f"{BTN_LIST} – see your tasks, tap ✅ to finish one\n"
+    f"{BTN_LIST} – see your tasks, tap ✅ to finish one or ✏️ to change it\n"
     f"{BTN_CAL} – see your deadlines in Google Calendar\n\n"
     "Commands also work:\n"
     "/add <task> @ <date> – save a task\n"
     "/list – see your tasks\n"
+    "/edit <number> – change a task\n"
     "/done <number> – remove a task\n"
     "/doneall – clear all tasks\n"
     "/calendar – get your calendar link\n\n"
@@ -97,10 +99,12 @@ def connect():
             # and never touches existing rows.
             cur.execute("CREATE TABLE IF NOT EXISTS tasks (id SERIAL PRIMARY KEY, chat_id BIGINT, task TEXT)")
             cur.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS due DATE")
+            cur.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS due_time TIME")
             cur.execute("CREATE INDEX IF NOT EXISTS tasks_chat_id_idx ON tasks (chat_id)")
             cur.execute("CREATE TABLE IF NOT EXISTS users (chat_id BIGINT PRIMARY KEY, first_name TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now())")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS cal_token TEXT")
             cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_cal_token_idx ON users (cal_token)")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS editing_task_id INTEGER")
             conn.commit()
         except Exception:
             conn.close()
@@ -110,16 +114,29 @@ def connect():
 
 
 def save_user(cur, chat_id, first_name):
+    """Add/update the user. Returns the id of the task they're editing (or None)."""
     # "Upsert": add the user the first time, update their name after that.
     cur.execute(
         "INSERT INTO users (chat_id, first_name) VALUES (%s, %s) "
-        "ON CONFLICT (chat_id) DO UPDATE SET first_name = EXCLUDED.first_name",
+        "ON CONFLICT (chat_id) DO UPDATE SET first_name = EXCLUDED.first_name "
+        "RETURNING editing_task_id",
         (chat_id, first_name),
     )
+    return cur.fetchone()[0]
+
+
+def india_now():
+    """The time in India right now, without timezone info (easier to compare)."""
+    return datetime.now(ZoneInfo("Asia/Kolkata")).replace(tzinfo=None)
 
 
 def india_today():
-    return datetime.now(ZoneInfo("Asia/Kolkata")).date()
+    return india_now().date()
+
+
+# Same order everywhere, so "/done 3" means the 3rd task in /list.
+# Inside one day, all-day tasks come first, then timed ones by time.
+TASK_ORDER = "ORDER BY due NULLS LAST, due_time NULLS FIRST, id"
 
 
 def nice_date(d):
@@ -128,40 +145,102 @@ def nice_date(d):
     return d.strftime('%a, %d %b %Y')
 
 
+def nice_time(t):
+    return t.strftime("%I:%M %p").lstrip("0")  # 17:00 -> "5:00 PM"
+
+
+def nice_when(due, due_time):
+    text = nice_date(due)
+    if due_time:
+        text += f", {nice_time(due_time)}"
+    return text
+
+
 GREETINGS = {"hi", "hii", "hello", "hey", "heyy", "yo", "hola", "namaste", "thanks", "thank you",
              "thx", "ty", "ok", "okay", "k", "cool", "nice", "good morning", "gm", "good night", "gn", "bye"}
 
 
 def add_task(cur, chat_id, text):
     """Save a task typed as normal text, e.g. "chem record friday"."""
-    today = india_today()
+    now = india_now()
     if " @" in text:
         # Old style: "task @ date". Everything after @ is the date.
         # (Needs a space before @, so emails like prof@college.edu are left alone.)
         task, _, date_text = text.partition(" @")
         task = clean(task)
-        _, due = extract_date(date_text, today)
-        if due is None and date_text.strip():
+        _, due, due_time = extract_when(date_text, now)
+        if due is None and due_time is None and date_text.strip():
             # Our patterns didn't know it. Let dateparser have a go ("in 2 months" etc).
-            now_india = datetime.now(ZoneInfo("Asia/Kolkata")).replace(tzinfo=None)
-            parsed = dateparser.parse(date_text, settings={"PREFER_DATES_FROM": "future", "DATE_ORDER": "DMY", "RELATIVE_BASE": now_india})
+            parsed = dateparser.parse(date_text, settings={"PREFER_DATES_FROM": "future", "DATE_ORDER": "DMY", "RELATIVE_BASE": now})
             if parsed is None:
                 return "I couldn't understand that date 🤔 Try: physics test 25 oct"
             due = parsed.date()
     else:
-        task, due = extract_date(text, today)
+        task, due, due_time = extract_when(text, now)
 
     if not task:
         return "What's the task? Type it like this:\nchem record friday"
+    if due_time and not due:
+        due = day_for_time(due_time, now)  # "call mom 5pm" = today (or tomorrow if 5pm passed)
 
     # RETURNING id gives us the new row's id, so the Undo button knows what to delete.
-    cur.execute("INSERT INTO tasks (chat_id, task, due) VALUES (%s, %s, %s) RETURNING id", (chat_id, task, due))
+    cur.execute("INSERT INTO tasks (chat_id, task, due, due_time) VALUES (%s, %s, %s, %s) RETURNING id",
+                (chat_id, task, due, due_time))
     task_id = cur.fetchone()[0]
 
     reply = f"Saved ✅ {task}"
     if due:
-        reply += f"\n📅 {nice_date(due)}"
-    return reply, [[{"text": "↩️ Undo", "callback_data": f"undo:{task_id}"}]]
+        reply += f"\n📅 {nice_when(due, due_time)}"
+    return reply, [[{"text": "↩️ Undo", "callback_data": f"undo:{task_id}"},
+                    {"text": "✏️ Edit", "callback_data": f"edit:{task_id}"}]]
+
+
+def start_edit(cur, chat_id, task_id):
+    """Remember which task this user is editing, and tell them what to send."""
+    cur.execute("SELECT task, due, due_time FROM tasks WHERE id = %s AND chat_id = %s", (task_id, chat_id))
+    row = cur.fetchone()
+    if row is None:
+        return None
+    task, due, due_time = row
+    cur.execute("UPDATE users SET editing_task_id = %s WHERE chat_id = %s", (task_id, chat_id))
+    current = f"{task} — 📅 {nice_when(due, due_time)}" if due else task
+    return (
+        f"✏️ Editing: {current}\n\n"
+        "Send me the change:\n"
+        "• a new day or time → monday 5pm\n"
+        "• a new name → chem record part 2\n"
+        "• both → chem record part 2 monday\n"
+        "• no date → remove the date\n\n"
+        "Or send /cancel to keep it as it is."
+    )
+
+
+def edit_task(cur, chat_id, task_id, text):
+    """Apply the user's change to the task they're editing."""
+    cur.execute("SELECT task, due, due_time FROM tasks WHERE id = %s AND chat_id = %s", (task_id, chat_id))
+    row = cur.fetchone()
+    if row is None:
+        return "That task is already gone 🤔"
+    old_task, old_due, old_time = row
+
+    if text.lower().strip(" .!") == "no date":
+        task, due, due_time = old_task, None, None
+    else:
+        now = india_now()
+        task, due, due_time = extract_when(text, now)
+        if not task:
+            task = old_task  # they only sent a new day/time
+        if due is None and due_time is None:
+            due, due_time = old_due, old_time  # they only sent a new name
+        elif due is None:
+            due = old_due or day_for_time(due_time, now)  # only a new time: keep the day
+
+    cur.execute("UPDATE tasks SET task = %s, due = %s, due_time = %s WHERE id = %s AND chat_id = %s",
+                (task, due, due_time, task_id, chat_id))
+    reply = f"Updated ✏️ {task}"
+    if due:
+        reply += f"\n📅 {nice_when(due, due_time)}"
+    return reply, [[{"text": "✏️ Edit again", "callback_data": f"edit:{task_id}"}]]
 
 
 def short(task, size=28):
@@ -171,7 +250,7 @@ def short(task, size=28):
 
 def list_view(cur, chat_id):
     """The task list text plus one ✅ button per task. Used by /list and after a ✅ tap."""
-    cur.execute("SELECT id, task, due FROM tasks WHERE chat_id = %s ORDER BY due NULLS LAST, id", (chat_id,))
+    cur.execute(f"SELECT id, task, due, due_time FROM tasks WHERE chat_id = %s {TASK_ORDER}", (chat_id,))
     rows = cur.fetchall()
     if not rows:
         return "No tasks left 🎉\nJust type one, like: chem record friday", None
@@ -179,31 +258,34 @@ def list_view(cur, chat_id):
     today = india_today()
     lines = ["📋 Your tasks:", ""]
     buttons = []
-    for number, (task_id, task, due) in enumerate(rows, start=1):
+    for number, (task_id, task, due, due_time) in enumerate(rows, start=1):
         line = f"{number}. {task}"
         if due:
-            line += f" — 📅 {nice_date(due)}"
+            line += f" — 📅 {nice_when(due, due_time)}"
             if due < today:
                 line += " ⚠️"
         lines.append(line)
-        if len(buttons) < 50:  # Telegram allows 100 buttons per message
-            # The button carries the real database id, not the list number.
-            buttons.append([{"text": f"✅ {number}. {short(task)}", "callback_data": f"done:{task_id}"}])
-    lines += ["", "Tap ✅ when you finish one."]
+        if len(buttons) < 45:  # 2 buttons per row; Telegram allows 100 buttons per message
+            # The buttons carry the real database id, not the list number.
+            buttons.append([{"text": f"✅ {number}. {short(task)}", "callback_data": f"done:{task_id}"},
+                            {"text": "✏️", "callback_data": f"edit:{task_id}"}])
+    lines += ["", "Tap ✅ when you finish one, ✏️ to change it."]
     return "\n".join(lines)[:4000], buttons  # Telegram's limit is 4096 characters
 
 
 def reminder_view(rows, today):
-    """Morning reminder text and buttons for one user's (id, task, due) rows."""
+    """Morning reminder text and buttons for one user's (id, task, due, due_time) rows."""
     lines = ["Good morning! ☀️ Here's what's due:", ""]
     buttons = []
-    for task_id, task, due in rows:
+    for task_id, task, due, due_time in rows:
         if due < today:
             label = "⚠️ Overdue"
         elif due == today:
             label = "🔥 Today"
         else:
             label = "⏰ Tomorrow"
+        if due_time:
+            label += f" {nice_time(due_time)}"
         lines.append(f"{label}: {task}")
         buttons.append([{"text": f"✅ {short(task)}", "callback_data": f"rdone:{task_id}"}])
     return "\n".join(lines)[:4000], buttons[:50]
@@ -235,7 +317,16 @@ def calendar_message(cur, chat_id, reset):
     )
 
 
-def handle_message(cur, chat_id, text):
+def handle_message(cur, chat_id, text, editing_id=None):
+    if editing_id is not None:
+        # They tapped ✏️ before, so this message is the change. Editing ends either way.
+        cur.execute("UPDATE users SET editing_task_id = NULL WHERE chat_id = %s", (chat_id,))
+        if text == "/cancel":
+            return "Okay, nothing changed 👍"
+        if not text.startswith("/") and text not in [BTN_LIST, BTN_ADD, BTN_CAL, BTN_HELP]:
+            return edit_task(cur, chat_id, editing_id, text)
+        # A command or button: stop editing and do that instead (below).
+
     if text.lower().strip("!.? ") in GREETINGS:
         return "Hello buddy 👋 Just type a task, like: chem record friday"
 
@@ -273,13 +364,27 @@ def handle_message(cur, chat_id, text):
 
     elif text.startswith("/done "):
         num_text = text[6:]
-        cur.execute("SELECT id FROM tasks WHERE chat_id = %s ORDER BY due NULLS LAST, id", (chat_id,))
+        cur.execute(f"SELECT id FROM tasks WHERE chat_id = %s {TASK_ORDER}", (chat_id,))
         rows = cur.fetchall()
         if num_text.isdigit() and 1 <= int(num_text) <= len(rows):
             real_id = rows[int(num_text) - 1][0]
             cur.execute("DELETE FROM tasks WHERE id = %s AND chat_id = %s", (real_id, chat_id))
             return "Deleted 🗑️"
         return "No task with that number 🤔"
+
+    elif text == "/edit":
+        return "Which one? Type it like this:\n/edit 2\n\nOr tap ✏️ next to a task in 📋 My tasks."
+
+    elif text.startswith("/edit "):
+        num_text = text[6:]
+        cur.execute(f"SELECT id FROM tasks WHERE chat_id = %s {TASK_ORDER}", (chat_id,))
+        rows = cur.fetchall()
+        if num_text.isdigit() and 1 <= int(num_text) <= len(rows):
+            return start_edit(cur, chat_id, rows[int(num_text) - 1][0])
+        return "No task with that number 🤔"
+
+    elif text == "/cancel":
+        return "Nothing to cancel 🙂"
 
     elif text.startswith("/"):
         return "I don't know that command 🤔 Tap ❓ Help to see what I can do."
@@ -290,12 +395,13 @@ def handle_message(cur, chat_id, text):
 
 
 def handle_callback(cur, chat_id, data):
-    """A tap on an inline button. Returns (popup_text, new_text, new_buttons).
-    new_text None means "leave the message as it is"."""
+    """A tap on an inline button. Returns (popup_text, new_text, new_buttons, new_message).
+    new_text None means "leave the tapped message as it is".
+    new_message is an extra message to send (or None)."""
     # callback_data looks like "undo:57" -> action "undo", task id 57
     action, _, task_id = data.partition(":")
     if not task_id.isdigit():
-        return "This button is old. Send /list again 🙂", None, None
+        return "This button is old. Send /list again 🙂", None, None, None
     task_id = int(task_id)
 
     if action == "undo":
@@ -303,8 +409,14 @@ def handle_callback(cur, chat_id, data):
         cur.execute("DELETE FROM tasks WHERE id = %s AND chat_id = %s RETURNING task", (task_id, chat_id))
         row = cur.fetchone()
         if row is None:
-            return "Already removed", None, None
-        return "Undone ↩️", f"↩️ Removed: {row[0]}", None
+            return "Already removed", None, None, None
+        return "Undone ↩️", f"↩️ Removed: {row[0]}", None, None
+
+    if action == "edit":
+        instructions = start_edit(cur, chat_id, task_id)
+        if instructions is None:
+            return "That task is already gone", None, None, None
+        return "Editing ✏️", None, None, instructions
 
     if action in ("done", "rdone"):
         cur.execute("DELETE FROM tasks WHERE id = %s AND chat_id = %s RETURNING task", (task_id, chat_id))
@@ -314,19 +426,19 @@ def handle_callback(cur, chat_id, data):
         if action == "done":
             # Tapped on the task list: show the list again, minus that task.
             text, buttons = list_view(cur, chat_id)
-            return popup, text, buttons
+            return popup, text, buttons, None
 
         # Tapped on the morning reminder: show the reminder again, minus that task.
         today = india_today()
-        cur.execute("SELECT id, task, due FROM tasks WHERE chat_id = %s AND due <= %s ORDER BY due, id",
+        cur.execute(f"SELECT id, task, due, due_time FROM tasks WHERE chat_id = %s AND due <= %s {TASK_ORDER}",
                     (chat_id, today + timedelta(days=1)))
         rows = cur.fetchall()
         if not rows:
-            return popup, "All done for now 🎉 Nice work!", None
+            return popup, "All done for now 🎉 Nice work!", None, None
         text, buttons = reminder_view(rows, today)
-        return popup, text, buttons
+        return popup, text, buttons, None
 
-    return "This button is old. Send /list again 🙂", None, None
+    return "This button is old. Send /list again 🙂", None, None, None
 
 
 def on_message(message):
@@ -336,8 +448,8 @@ def on_message(message):
 
     with connect() as conn:
         cur = conn.cursor()
-        save_user(cur, chat_id, first_name)
-        reply = handle_message(cur, chat_id, text)
+        editing_id = save_user(cur, chat_id, first_name)
+        reply = handle_message(cur, chat_id, text, editing_id)
         conn.commit()
 
     markup = None
@@ -363,7 +475,7 @@ def on_callback(cq):
     with connect() as conn:
         cur = conn.cursor()
         save_user(cur, chat_id, cq["from"].get("first_name"))
-        popup, new_text, buttons = handle_callback(cur, chat_id, data)
+        popup, new_text, buttons, new_message = handle_callback(cur, chat_id, data)
         conn.commit()
 
     # Always answer, or the button shows a loading spinner for a long time.
@@ -374,6 +486,9 @@ def on_callback(cq):
         if buttons:
             params["reply_markup"] = {"inline_keyboard": buttons}
         tg("editMessageText", **params)
+
+    if new_message:
+        tg("sendMessage", chat_id=chat_id, text=new_message, reply_markup=MAIN_KEYBOARD)
 
 
 @app.route("/")
@@ -417,7 +532,7 @@ def calendar_feed(token):
         user = cur.fetchone()
         if user is None:
             return "Not found", 404
-        cur.execute("SELECT id, task, due FROM tasks WHERE chat_id = %s AND due IS NOT NULL ORDER BY due, id", (user[0],))
+        cur.execute(f"SELECT id, task, due, due_time FROM tasks WHERE chat_id = %s AND due IS NOT NULL {TASK_ORDER}", (user[0],))
         rows = cur.fetchall()
 
     return Response(
@@ -437,13 +552,14 @@ def daily_reminder():
 
     with connect() as conn:
         cur = conn.cursor()
-        cur.execute("SELECT chat_id, id, task, due FROM tasks WHERE due <= %s ORDER BY chat_id, due, id", (today + timedelta(days=1),))
+        cur.execute("SELECT chat_id, id, task, due, due_time FROM tasks WHERE due <= %s "
+                    "ORDER BY chat_id, due, due_time NULLS FIRST, id", (today + timedelta(days=1),))
         rows = cur.fetchall()
 
-    # Group the rows by user: {chat_id: [(id, task, due), ...]}
+    # Group the rows by user: {chat_id: [(id, task, due, due_time), ...]}
     per_user = {}
-    for chat_id, task_id, task, due in rows:
-        per_user.setdefault(chat_id, []).append((task_id, task, due))
+    for chat_id, task_id, task, due, due_time in rows:
+        per_user.setdefault(chat_id, []).append((task_id, task, due, due_time))
 
     for chat_id, user_rows in per_user.items():
         text, buttons = reminder_view(user_rows, today)

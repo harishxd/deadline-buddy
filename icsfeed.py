@@ -11,7 +11,10 @@ An .ics file is just text in a fixed format (RFC 5545):
     END:VEVENT
     END:VCALENDAR
 """
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+INDIA = ZoneInfo("Asia/Kolkata")
 
 
 def escape(text):
@@ -34,8 +37,14 @@ def fold(line):
     return "\r\n".join(parts)
 
 
+def utc_stamp(due, due_time):
+    """India date + time -> UTC text like 20261023T113000Z (5:00 PM IST = 11:30 UTC)."""
+    start = datetime.combine(due, due_time, tzinfo=INDIA).astimezone(timezone.utc)
+    return start.strftime("%Y%m%dT%H%M%SZ")
+
+
 def make_ics(rows, now_utc):
-    """rows: [(task_id, task, due_date), ...]   now_utc: when this feed was made."""
+    """rows: [(task_id, task, due_date, due_time_or_None), ...]   now_utc: when this feed was made."""
     stamp = now_utc.strftime("%Y%m%dT%H%M%SZ")
     lines = [
         "BEGIN:VCALENDAR",
@@ -49,15 +58,22 @@ def make_ics(rows, now_utc):
         "REFRESH-INTERVAL;VALUE=DURATION:PT1H",
         "X-PUBLISHED-TTL:PT1H",
     ]
-    for task_id, task, due in rows:
+    for task_id, task, due, due_time in rows:
+        if due_time is None:
+            # VALUE=DATE (no time) = an all-day event. DTEND is the day *after*.
+            when = [f"DTSTART;VALUE=DATE:{due:%Y%m%d}",
+                    f"DTEND;VALUE=DATE:{due + timedelta(days=1):%Y%m%d}"]
+        else:
+            # A timed event, written in UTC (the Z at the end). One hour long.
+            end = datetime.combine(due, due_time) + timedelta(hours=1)
+            when = [f"DTSTART:{utc_stamp(due, due_time)}",
+                    f"DTEND:{utc_stamp(end.date(), end.time())}"]
         lines += [
             "BEGIN:VEVENT",
             # The UID never changes for a task, so the calendar updates it instead of making a copy.
             f"UID:task-{task_id}@deadline-buddy",
             f"DTSTAMP:{stamp}",
-            # VALUE=DATE (no time) = an all-day event. DTEND is the day *after*.
-            f"DTSTART;VALUE=DATE:{due:%Y%m%d}",
-            f"DTEND;VALUE=DATE:{due + timedelta(days=1):%Y%m%d}",
+            *when,
             f"SUMMARY:{escape(task)}",
             "DESCRIPTION:From Deadline Buddy on Telegram",
             "TRANSP:TRANSPARENT",  # don't show you as "busy" all day
