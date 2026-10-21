@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from flask import Flask, request, g, jsonify
 from dotenv import load_dotenv
+from dates import extract_date, clean
 
 load_dotenv()
 
@@ -113,39 +114,66 @@ def save_user(cur, chat_id, first_name):
     )
 
 
+def india_today():
+    return datetime.now(ZoneInfo("Asia/Kolkata")).date()
+
+
 def nice_date(d):
-    if d.year == datetime.now(ZoneInfo("Asia/Kolkata")).year:
+    if d.year == india_today().year:
         return d.strftime('%a, %d %b')
     return d.strftime('%a, %d %b %Y')
 
 
+GREETINGS = {"hi", "hii", "hello", "hey", "heyy", "yo", "hola", "namaste", "thanks", "thank you",
+             "thx", "ty", "ok", "okay", "k", "cool", "nice", "good morning", "gm", "good night", "gn", "bye"}
+
+
+def add_task(cur, chat_id, text):
+    """Save a task typed as normal text, e.g. "chem record friday"."""
+    today = india_today()
+    if "@" in text:
+        # Old style: "task @ date". Everything after @ is the date.
+        task, _, date_text = text.partition("@")
+        task = clean(task)
+        leftover, due = extract_date(date_text, today)
+        if due is None and date_text.strip():
+            # Our patterns didn't know it. Let dateparser have a go ("in 2 months" etc).
+            now_india = datetime.now(ZoneInfo("Asia/Kolkata")).replace(tzinfo=None)
+            parsed = dateparser.parse(date_text, settings={"PREFER_DATES_FROM": "future", "DATE_ORDER": "DMY", "RELATIVE_BASE": now_india})
+            if parsed is None:
+                return "I couldn't understand that date 🤔 Try: physics test 25 oct"
+            due = parsed.date()
+    else:
+        task, due = extract_date(text, today)
+
+    if not task:
+        return "What's the task? Type it like this:\nchem record friday"
+
+    # RETURNING id gives us the new row's id, so the Undo button knows what to delete.
+    cur.execute("INSERT INTO tasks (chat_id, task, due) VALUES (%s, %s, %s) RETURNING id", (chat_id, task, due))
+    task_id = cur.fetchone()[0]
+
+    reply = f"Saved ✅ {task}"
+    if due:
+        reply += f"\n📅 {nice_date(due)}"
+    return reply, [[{"text": "↩️ Undo", "callback_data": f"undo:{task_id}"}]]
+
+
 def handle_message(cur, chat_id, text):
-    if text.lower() == "hi":
-        return "Hello buddy 👋"
+    if text.lower().strip("!.? ") in GREETINGS:
+        return "Hello buddy 👋 Just type a task, like: chem record friday"
 
     elif text in ["/start", "/help", BTN_HELP]:
         return HELP_TEXT
 
-    elif text == "/add":
-        return "What should I save? Type it like this:\n/add Physics test @ 25 Oct"
+    elif text in ["/add", BTN_ADD]:
+        return "Just type your task and when it's due 👇\n\nchem record friday\nphysics test 25 oct\nsubmit lab tomorrow"
 
     elif text.startswith("/add "):
-        task, _, date_text = text[5:].partition("@")
-        task = task.strip()
-        date_text = date_text.strip()
-        if not task:
-            return "What's the task? Type it like this:\n/add Physics test @ 25 Oct"
-        due = None
-        if date_text:
-            now_india = datetime.now(ZoneInfo("Asia/Kolkata")).replace(tzinfo=None)
-            parsed = dateparser.parse(date_text, settings={"PREFER_DATES_FROM": "future", "DATE_ORDER": "DMY", "RELATIVE_BASE": now_india})
-            if parsed is None:
-                return "I couldn't understand that date 🤔 Try: /add Physics test @ 25 Oct"
-            due = parsed.date()
-        cur.execute("INSERT INTO tasks (chat_id, task, due) VALUES (%s, %s, %s)", (chat_id, task, due))
-        if due:
-            return f"Saved ✅ {task}\n📅 Due {nice_date(due)}"
-        return "Saved ✅ " + task
+        return add_task(cur, chat_id, text[5:])
+
+    elif text in ["/calendar", BTN_CAL]:
+        return "Calendar is coming soon 📅"
 
     elif text in ["/list", BTN_LIST]:
         cur.execute("SELECT task, due FROM tasks WHERE chat_id = %s ORDER BY due NULLS LAST, id", (chat_id,))
@@ -186,13 +214,31 @@ def handle_message(cur, chat_id, text):
             return "Deleted 🗑️"
         return "No task with that number 🤔"
 
+    elif text.startswith("/"):
+        return "I don't know that command 🤔 Tap ❓ Help to see what I can do."
+
     else:
-        return "You said: " + text
+        # Anything else is a new task.
+        return add_task(cur, chat_id, text)
 
 
 def handle_callback(cur, chat_id, data):
     """A tap on an inline button. Returns (popup_text, new_text, new_buttons).
     new_text None means "leave the message as it is"."""
+    # callback_data looks like "undo:57" -> action "undo", task id 57
+    action, _, task_id = data.partition(":")
+    if not task_id.isdigit():
+        return "This button is old. Send /list again 🙂", None, None
+    task_id = int(task_id)
+
+    if action == "undo":
+        # chat_id in the WHERE means you can only ever delete your own task.
+        cur.execute("DELETE FROM tasks WHERE id = %s AND chat_id = %s RETURNING task", (task_id, chat_id))
+        row = cur.fetchone()
+        if row is None:
+            return "Already removed", None, None
+        return "Undone ↩️", f"↩️ Removed: {row[0]}", None
+
     return "This button is old. Send /list again 🙂", None, None
 
 
