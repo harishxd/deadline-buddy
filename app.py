@@ -38,11 +38,11 @@ app = Flask(__name__)
 # normal text message, so handle_message() checks for these exact strings.
 BTN_LIST = "📋 My tasks"
 BTN_ADD = "➕ Add"
-BTN_CAL = "📅 Calendar"
+BTN_CAL = "📅 Calendar"  # no longer on the keyboard (use /calendar), still understood from old keyboards
 BTN_HELP = "❓ Help"
 
 MAIN_KEYBOARD = {
-    "keyboard": [[BTN_LIST, BTN_ADD], [BTN_CAL, BTN_HELP]],
+    "keyboard": [[BTN_LIST, BTN_ADD, BTN_HELP]],  # one row, so it takes less space
     "resize_keyboard": True,
     "is_persistent": True,
 }
@@ -56,15 +56,14 @@ HELP_TEXT = (
     "• submit lab tomorrow\n"
     "• call mom friday 5pm\n\n"
     "Buttons below:\n"
-    f"{BTN_LIST} – see your tasks, tap ✅ to finish one or ✏️ to change it\n"
-    f"{BTN_CAL} – see your deadlines in Google Calendar\n\n"
+    f"{BTN_LIST} – see your tasks, tap ✅ to finish one or ✏️ to change it\n\n"
     "Commands also work:\n"
     "/add <task> @ <date> – save a task\n"
     "/list – see your tasks\n"
     "/edit <number> – change a task\n"
     "/done <number> – remove a task\n"
     "/doneall – clear all tasks\n"
-    "/calendar – get your calendar link\n\n"
+    "/calendar – see your deadlines in Google Calendar\n\n"
     "☀️ Every morning I'll remind you what's overdue, due today and due tomorrow."
 )
 

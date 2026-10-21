@@ -14,12 +14,12 @@ Open it in Telegram, then just type what you need to do.
 - **Undo and Edit.** Every "Saved ✅" reply has ↩️ Undo and ✏️ Edit buttons. To edit,
   send a new day/time (`monday 5pm`), a new name, both, or `no date`.
 - **Buttons, no commands needed.** A keyboard under the typing box:
-  📋 My tasks · ➕ Add · 📅 Calendar · ❓ Help
+  📋 My tasks · ➕ Add · ❓ Help
 - **Tap to finish.** The task list has a ✅ button per task (and ✏️ to change it).
   Tapping ✅ deletes the task and updates the list in place.
 - **Morning reminder.** Every day at 5:30 AM IST the bot sends what's overdue, due
   today and due tomorrow, with ✅ buttons.
-- **Google Calendar.** 📅 Calendar gives you a private link. Add it in Google
+- **Google Calendar.** `/calendar` gives you a private link. Add it in Google
   Calendar (Other calendars → + → From URL) and tasks **with a date** show up (all-day,
   or at their time). Tasks without a date stay in the bot only. `/calendar reset`
   makes a new link if you leaked the old one.
