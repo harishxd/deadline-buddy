@@ -565,6 +565,37 @@ def home():
     return "Deadline Buddy is alive! 🤖"
 
 
+# Google needs a privacy policy link before an app that uses Google sign-in can be published.
+PRIVACY_PAGE = """<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Deadline Buddy – Privacy</title>
+<style>body{font-family:system-ui,sans-serif;max-width:640px;margin:2rem auto;padding:0 1rem;line-height:1.6}</style>
+</head><body>
+<h1>Deadline Buddy – Privacy policy</h1>
+<p>Deadline Buddy is a small personal Telegram bot that remembers tasks and deadlines.</p>
+<h2>What it stores</h2>
+<ul>
+<li>Your Telegram chat id and first name, so your tasks stay yours.</li>
+<li>The tasks you send it, with their dates and times.</li>
+<li>A random secret for your private calendar link, if you ask for one.</li>
+<li>For the owner only: a Google sign-in token used to keep one calendar named
+"Deadline Buddy" in sync. The bot cannot see or change any other calendar.</li>
+</ul>
+<h2>What it does with it</h2>
+<p>Only shows your tasks back to you, sends your morning reminder, and builds your calendar.
+Nothing is sold, shared, or used for ads.</p>
+<h2>Deleting your data</h2>
+<p>Send <code>/doneall yes</code> to delete all your tasks, or <code>/calendar reset</code> to turn off your
+calendar link. Google access can be removed at any time from your Google Account's
+"Third-party connections" page.</p>
+</body></html>"""
+
+
+@app.route("/privacy")
+def privacy():
+    return Response(PRIVACY_PAGE, mimetype="text/html")
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     # Only checked once WEBHOOK_SECRET is set, so the bot keeps working while it's being set up.
