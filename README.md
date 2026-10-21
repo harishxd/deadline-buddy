@@ -9,21 +9,25 @@ Open it in Telegram, then just type what you need to do.
   `submit lab tomorrow`, `pay fees next monday`. The bot finds the date, removes it
   from the task name, and saves it. Normal numbers like `chapter 5 notes` or `lab 3`
   are left alone.
-- **Undo.** Every "Saved ✅" reply has a ↩️ Undo button.
+- **Times too.** `call mom friday 5pm`, `viva 9:30 am on 3rd nov`, `lunch at noon`.
+  A time with no day means today (or tomorrow if that time already passed).
+- **Undo and Edit.** Every "Saved ✅" reply has ↩️ Undo and ✏️ Edit buttons. To edit,
+  send a new day/time (`monday 5pm`), a new name, both, or `no date`.
 - **Buttons, no commands needed.** A keyboard under the typing box:
   📋 My tasks · ➕ Add · 📅 Calendar · ❓ Help
-- **Tap to finish.** The task list has a ✅ button per task. Tapping it deletes the
-  task and updates the list in place.
+- **Tap to finish.** The task list has a ✅ button per task (and ✏️ to change it).
+  Tapping ✅ deletes the task and updates the list in place.
 - **Morning reminder.** Every day at 5:30 AM IST the bot sends what's overdue, due
   today and due tomorrow, with ✅ buttons.
 - **Google Calendar.** 📅 Calendar gives you a private link. Add it in Google
-  Calendar (Other calendars → + → From URL) and your dated tasks show up as all-day
-  events. `/calendar reset` makes a new link if you leaked the old one.
+  Calendar (Other calendars → + → From URL) and tasks **with a date** show up (all-day,
+  or at their time). Tasks without a date stay in the bot only. `/calendar reset`
+  makes a new link if you leaked the old one.
 - **Private.** Every query filters by your chat id, so you only ever see or change
   your own tasks.
 
-Backup commands: `/add <task> @ <date>`, `/list`, `/done <n>`, `/doneall`,
-`/calendar`, `/calendar reset`, `/help`.
+Backup commands: `/add <task> @ <date>`, `/list`, `/edit <n>`, `/cancel`, `/done <n>`,
+`/doneall`, `/calendar`, `/calendar reset`, `/help`.
 
 ## How it works
 
@@ -36,9 +40,9 @@ Vercel cron (00:00 UTC) ──GET /cron/daily──▶ Vercel ──▶ Telegram
 | File | What's in it |
 |---|---|
 | `app.py` | The Flask app: webhook, buttons, commands, calendar feed, morning cron |
-| `dates.py` | Finds a date inside a sentence (`extract_date`) |
+| `dates.py` | Finds a date and time inside a sentence (`extract_when`) |
 | `icsfeed.py` | Builds the `.ics` calendar text (`make_ics`) |
-| `test_dates.py` | 33 example sentences for the date finder |
+| `test_dates.py` | 47 example sentences for the date and time finder |
 | `test_ics.py` | Checks the calendar feed is valid, using the `icalendar` package |
 | `fake_telegram.py` | Pretends to be Telegram for local testing |
 | `vercel.json` | The daily cron job |
@@ -46,8 +50,8 @@ Vercel cron (00:00 UTC) ──GET /cron/daily──▶ Vercel ──▶ Telegram
 
 Database tables:
 
-- `tasks(id, chat_id, task, due)`
-- `users(chat_id, first_name, created_at, cal_token)`
+- `tasks(id, chat_id, task, due, due_time)`
+- `users(chat_id, first_name, created_at, cal_token, editing_task_id)`
 
 Tables are created automatically (`CREATE TABLE IF NOT EXISTS`) the first time the
 app connects.

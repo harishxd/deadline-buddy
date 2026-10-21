@@ -24,8 +24,11 @@ Contents
 17. [Secret links with random tokens](#17-secret-links-with-random-tokens)
 18. [Serving the feed from Flask](#18-serving-the-feed-from-flask)
 19. [Validating the feed](#19-validating-the-feed)
-20. [Phase 3: real Google Calendar sync (not built)](#20-phase-3-real-google-calendar-sync-not-built)
-21. [Ideas for later](#21-ideas-for-later)
+20. [Times: "call mom friday 5pm"](#20-times-call-mom-friday-5pm)
+21. [Editing a task: remembering a conversation](#21-editing-a-task-remembering-a-conversation)
+22. [Phase 3: real Google Calendar sync, just for you (not built)](#22-phase-3-real-google-calendar-sync-just-for-you-not-built)
+23. [The webhook secret, explained](#23-the-webhook-secret-explained)
+24. [Ideas for later](#24-ideas-for-later)
 
 ---
 
@@ -266,7 +269,8 @@ your existing friends get the keyboard on their next message without typing /sta
 The second kind of keyboard is attached **to one message**, under its text:
 
 ```python
-    return reply, [[{"text": "↩️ Undo", "callback_data": f"undo:{task_id}"}]]
+    return reply, [[{"text": "↩️ Undo", "callback_data": f"undo:{task_id}"},
+                    {"text": "✏️ Edit", "callback_data": f"edit:{task_id}"}]]
 ```
 
 | | Reply keyboard | Inline keyboard |
@@ -497,7 +501,8 @@ The Undo button needs to know *which row* to delete. Postgres can hand back the 
 of the row it just made:
 
 ```python
-    cur.execute("INSERT INTO tasks (chat_id, task, due) VALUES (%s, %s, %s) RETURNING id", (chat_id, task, due))
+    cur.execute("INSERT INTO tasks (chat_id, task, due, due_time) VALUES (%s, %s, %s, %s) RETURNING id",
+                (chat_id, task, due, due_time))
     task_id = cur.fetchone()[0]
 ```
 
@@ -537,12 +542,13 @@ One function builds the list text **and** its buttons, so the same code runs for
 `/list` and after every ✅ tap:
 
 ```python
-    for number, (task_id, task, due) in enumerate(rows, start=1):
+    for number, (task_id, task, due, due_time) in enumerate(rows, start=1):
         line = f"{number}. {task}"
         ...
-        if len(buttons) < 50:  # Telegram allows 100 buttons per message
-            # The button carries the real database id, not the list number.
-            buttons.append([{"text": f"✅ {number}. {short(task)}", "callback_data": f"done:{task_id}"}])
+        if len(buttons) < 45:  # 2 buttons per row; Telegram allows 100 buttons per message
+            # The buttons carry the real database id, not the list number.
+            buttons.append([{"text": f"✅ {number}. {short(task)}", "callback_data": f"done:{task_id}"},
+                            {"text": "✏️", "callback_data": f"edit:{task_id}"}])
 ```
 
 Why the real id and not the list number? List numbers shift. If you tap ✅ on #2,
@@ -564,15 +570,19 @@ An `.ics` file is plain text in a format every calendar app understands (its off
 name is RFC 5545). `icsfeed.py` writes it by hand:
 
 ```python
-    for task_id, task, due in rows:
+    for task_id, task, due, due_time in rows:
+        if due_time is None:
+            # VALUE=DATE (no time) = an all-day event. DTEND is the day *after*.
+            when = [f"DTSTART;VALUE=DATE:{due:%Y%m%d}",
+                    f"DTEND;VALUE=DATE:{due + timedelta(days=1):%Y%m%d}"]
+        else:
+            ...  # timed events: see section 20
         lines += [
             "BEGIN:VEVENT",
             # The UID never changes for a task, so the calendar updates it instead of making a copy.
             f"UID:task-{task_id}@deadline-buddy",
             f"DTSTAMP:{stamp}",
-            # VALUE=DATE (no time) = an all-day event. DTEND is the day *after*.
-            f"DTSTART;VALUE=DATE:{due:%Y%m%d}",
-            f"DTEND;VALUE=DATE:{due + timedelta(days=1):%Y%m%d}",
+            *when,
             f"SUMMARY:{escape(task)}",
             "DESCRIPTION:From Deadline Buddy on Telegram",
             "TRANSP:TRANSPARENT",  # don't show you as "busy" all day
@@ -652,7 +662,7 @@ def calendar_feed(token):
         user = cur.fetchone()
         if user is None:
             return "Not found", 404
-        cur.execute("SELECT id, task, due FROM tasks WHERE chat_id = %s AND due IS NOT NULL ORDER BY due, id", (user[0],))
+        cur.execute(f"SELECT id, task, due, due_time FROM tasks WHERE chat_id = %s AND due IS NOT NULL {TASK_ORDER}", (user[0],))
         rows = cur.fetchall()
 
     return Response(
@@ -702,69 +712,288 @@ python test_ics.py
 You can also paste your production link into an online validator such as
 icalendar.org's validator.
 
-## 20. Phase 3: real Google Calendar sync (not built)
+## 20. Times: "call mom friday 5pm"
 
-The ICS feed is one-way and slow (Google refreshes every few hours). Real two-way
-sync means the bot writes straight into your Google Calendar, and changes in Google
-come back. **None of this is built.** Say "go phase 3" if you want it.
+### Finding the time
 
-### What it needs: OAuth 2.0
+`dates.py` has three time patterns, used the same way as the date patterns:
 
-The bot can't use your Google password. Instead, OAuth works like this:
+```python
+# "at 5pm", "by 11:59 pm", "5.30pm" (needs am/pm) ...
+TIME_AMPM = re.compile(r"(?:\b(?:at|by|before|till|until)\s+)?\b(?P<h>\d{1,2})(?:[:.](?P<m>\d{2}))?\s*(?P<ampm>[ap])\.?m\b\.?", re.IGNORECASE)
+# ... "17:30", "at 10:30" (24-hour, needs a colon so "chapter 5.30" stays normal) ...
+TIME_24 = re.compile(r"(?:\b(?:at|by|before|till|until)\s+)?\b(?P<h>\d{1,2}):(?P<m>\d{2})(?![\d:])", re.IGNORECASE)
+# ... "at noon", "midnight"
+TIME_WORD = re.compile(r"(?:\b(?:at|by|before|till|until)\s+)?\b(?P<word>noon|midnight)\b", re.IGNORECASE)
+```
 
-1. You send `/connect`. The bot replies with a Google sign-in link.
-2. You sign in **on Google's site** and click "Allow Deadline Buddy to manage your
-   calendar events".
-3. Google sends your browser back to `https://deadline-buddy-one.vercel.app/oauth/callback?code=...&state=...`.
-4. The bot swaps that `code` for two tokens: an **access token** (works for about
-   1 hour) and a **refresh token** (used to get new access tokens later).
-5. The bot saves the refresh token in the database (a new table, encrypted). After
-   that, `/add` and ✅ call the Google Calendar API to create and delete events.
+- A time needs **am/pm** or a **colon**. So `5pm` and `17:30` are times, but
+  `chapter 5.30` and `buy 5 apples` aren't.
+- `at`/`by` in front is swallowed too, so "call mom **at 5pm**" leaves "call mom".
 
-New code: a `/connect` command, an `/oauth/callback` route, a `google_accounts`
-table, calls to the Calendar API (`events.insert`, `events.delete`), a `/disconnect`
-command that revokes the token, and a signed `state` value so nobody can link *their*
-Google account to *your* chat. All free: the Calendar API costs nothing at this size.
+Then `_to_time` turns the match into a real time, and throws away impossible ones:
 
-### What you'd set up by hand in Google Cloud Console
+```python
+    if groups.get("ampm"):
+        if not 1 <= hour <= 12:
+            return None
+        hour = hour % 12 + (12 if groups["ampm"].lower() == "p" else 0)  # 12am = 0:00, 12pm = 12:00
+    elif hour > 23:
+        return None
+```
 
-1. Go to console.cloud.google.com and create a project ("Deadline Buddy").
+The `% 12` trick: 5pm → `5 % 12 + 12 = 17`. 12pm → `12 % 12 + 12 = 12`. 12am →
+`12 % 12 + 0 = 0` (midnight). So `13pm` and `25:00` are rejected and stay as normal text.
+
+`extract_when` runs the time finder first, then the date finder on what's left:
+
+```python
+def extract_when(text, now):
+    text, due_time = extract_time(text)
+    task, due = extract_date(text, now.date())
+    return task, due, due_time
+```
+
+### A time with no day
+
+"call mom 5pm" has a time but no date. It means today, unless 5 PM already passed:
+
+```python
+def day_for_time(due_time, now):
+    """A time without a date ("call mom 5pm") means today, or tomorrow if it already passed."""
+    return now.date() if due_time > now.time() else now.date() + timedelta(days=1)
+```
+
+That's why `india_now()` exists next to `india_today()`: we need the clock, not just
+the date.
+
+### Storing and sorting
+
+A new nullable column (safe: old tasks just get `NULL`, meaning "no time"):
+
+```python
+            cur.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS due_time TIME")
+```
+
+One shared `ORDER BY` so `/done 3` and `/edit 3` always mean the 3rd row of `/list`:
+
+```python
+# Same order everywhere, so "/done 3" means the 3rd task in /list.
+# Inside one day, all-day tasks come first, then timed ones by time.
+TASK_ORDER = "ORDER BY due NULLS LAST, due_time NULLS FIRST, id"
+```
+
+### Timed calendar events
+
+All-day events have no time zone, but a timed event does. 5 PM in India is not 5 PM in
+London. The simplest correct way is to write the time in **UTC** (the `Z` at the end
+means UTC), and every calendar app converts it back to your local time:
+
+```python
+def utc_stamp(due, due_time):
+    """India date + time -> UTC text like 20261023T113000Z (5:00 PM IST = 11:30 UTC)."""
+    start = datetime.combine(due, due_time, tzinfo=INDIA).astimezone(timezone.utc)
+    return start.strftime("%Y%m%dT%H%M%SZ")
+```
+
+India is UTC+5:30, so 17:00 IST → 11:30 UTC. Timed events are made 1 hour long.
+`test_ics.py` checks that the event really shows as 5:00 PM when converted back to
+India time, and that an 11:30 PM event correctly ends the next day.
+
+### What times don't do (yet)
+
+The bot still only messages you **once a day**, at 5:30 AM. It can't ping you at 5 PM,
+because Vercel Hobby cron jobs run at most once a day. Google Calendar usually doesn't
+send alerts for events in URL-subscribed calendars either. Phase 3 (below) would fix
+this for you: real events in your Google Calendar get Google's normal phone alerts.
+
+## 21. Editing a task: remembering a conversation
+
+Every webhook call is a fresh start. The code forgets everything after it answers. But
+editing takes **two messages**: tap ✏️, then send the change. So the bot has to write
+down "this person is editing task 57" somewhere that survives between requests: the
+database.
+
+```python
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS editing_task_id INTEGER")
+```
+
+This is called **conversation state**. Bot libraries have it built in; we do it by hand.
+
+### Step 1: tap ✏️ → remember it
+
+```python
+def start_edit(cur, chat_id, task_id):
+    """Remember which task this user is editing, and tell them what to send."""
+    cur.execute("SELECT task, due, due_time FROM tasks WHERE id = %s AND chat_id = %s", (task_id, chat_id))
+    row = cur.fetchone()
+    if row is None:
+        return None
+    task, due, due_time = row
+    cur.execute("UPDATE users SET editing_task_id = %s WHERE chat_id = %s", (task_id, chat_id))
+```
+
+The `AND chat_id = %s` check happens **before** saving the edit state, so you can't
+start editing someone else's task.
+
+A button tap can now also send a brand-new message (the instructions), so
+`handle_callback` returns 4 things instead of 3:
+
+```python
+        return "Editing ✏️", None, None, instructions
+```
+
+### Step 2: the next message → apply it
+
+`save_user` already runs on every message, so it also hands back the edit state, with no
+extra query. `RETURNING` works on upserts too:
+
+```python
+        "ON CONFLICT (chat_id) DO UPDATE SET first_name = EXCLUDED.first_name "
+        "RETURNING editing_task_id",
+```
+
+Then, at the very top of `handle_message`:
+
+```python
+    if editing_id is not None:
+        # They tapped ✏️ before, so this message is the change. Editing ends either way.
+        cur.execute("UPDATE users SET editing_task_id = NULL WHERE chat_id = %s", (chat_id,))
+        if text == "/cancel":
+            return "Okay, nothing changed 👍"
+        if not text.startswith("/") and text not in [BTN_LIST, BTN_ADD, BTN_CAL, BTN_HELP]:
+            return edit_task(cur, chat_id, editing_id, text)
+        # A command or button: stop editing and do that instead (below).
+```
+
+The state is **always cleared**, whatever happens. A forgotten edit state is a nasty bug:
+the next normal task you type would silently overwrite an old task.
+
+### Merging the change
+
+The user might send only a new day, only a new name, or both. `edit_task` keeps
+whatever they didn't change:
+
+```python
+        task, due, due_time = extract_when(text, now)
+        if not task:
+            task = old_task  # they only sent a new day/time
+        if due is None and due_time is None:
+            due, due_time = old_due, old_time  # they only sent a new name
+        elif due is None:
+            due = old_due or day_for_time(due_time, now)  # only a new time: keep the day
+```
+
+| Task was | You send | Becomes |
+|---|---|---|
+| call mom — Fri, 5:00 PM | `7:30pm` | call mom — Fri, 7:30 PM |
+| call mom — Fri, 7:30 PM | `call mom and dad` | call mom and dad — Fri, 7:30 PM |
+| chem record — Thu | `chem record part 2 monday 9am` | chem record part 2 — Mon, 9:00 AM |
+| buy notebook — Fri | `no date` | buy notebook (and it leaves Google Calendar) |
+
+## 22. Phase 3: real Google Calendar sync, just for you (not built)
+
+The plan: **only you** get two-way sync with your Google account. Everyone else keeps
+the 📅 Calendar link exactly as now. **Nothing here is built yet.**
+
+### How "only me" works
+
+- A new environment variable, `OWNER_CHAT_ID`, holds your Telegram chat id.
+- The `/connect` command only works when the message comes from that chat id. For
+  anyone else it's treated like an unknown command. It isn't in `/help`, the keyboard
+  or BotFather's command list, so your friends never see it.
+- Since you're the only person who will ever sign in, the Google side gets much
+  simpler (see "the limits" below).
+
+### What it would do
+
+1. You send `/connect`, sign in to Google once and press Allow (OAuth; see below).
+2. The bot creates a separate **"Deadline Buddy"** calendar in your Google account.
+   It only works inside that calendar and never touches your other events.
+3. **Bot → Google, instantly:** adding, editing, ✅ or Undo immediately creates,
+   changes or deletes the Google event. Timed tasks become real timed events, so
+   **Google's normal phone alerts work** (a 5 PM notification for "call mom 5pm").
+4. **Google → bot:** if you move, rename or delete an event in that calendar in Google,
+   the bot catches up the **next time you message it**, and during the morning reminder.
+   It asks Google "what changed since last time?" (Google gives you a *sync token* for
+   exactly this). An event you create directly in that calendar becomes a task too.
+5. You'd remove your 📅 URL subscription afterwards, so you don't see every task twice.
+
+Why catch up "on your next message" instead of instantly? Google *can* push changes
+to a webhook, but those push channels expire and need renewing, and Vercel Hobby cron
+only runs once a day to renew them. Catching up when you open the bot is simpler, free,
+and you only look at your tasks in the bot anyway.
+
+### OAuth in one paragraph
+
+The bot never sees your Google password. You sign in on Google's own page and press
+Allow. Google sends you back to `https://deadline-buddy-one.vercel.app/oauth/callback`
+with a one-time `code`. The bot swaps it for an **access token** (works ~1 hour) and a
+**refresh token** (gets new access tokens later), and saves the refresh token in the
+database. A random `state` value stops anyone from linking *their* Google account to
+your chat.
+
+### What you'd set up by hand in Google Cloud Console (free)
+
+1. console.cloud.google.com → create a project ("Deadline Buddy").
 2. **APIs & Services → Library** → enable **Google Calendar API**.
-3. **OAuth consent screen** → user type **External** → app name, support email,
-   developer email. Add the scope `.../auth/calendar.events`.
-4. **Test users** → add your Google email and each friend's Google email.
-5. **Credentials → Create credentials → OAuth client ID** → type **Web application** →
-   authorized redirect URI `https://deadline-buddy-one.vercel.app/oauth/callback`.
-6. Copy the client ID and client secret into Vercel as `GOOGLE_CLIENT_ID` and
-   `GOOGLE_CLIENT_SECRET` (and into `.env`). Never commit them.
+3. **OAuth consent screen** → **External** → app name, your email as support and
+   developer email. Add a calendar scope. The bot needs to create its own calendar and
+   manage events in it.
+4. **Test users** → add your own Google email.
+5. **Credentials → Create credentials → OAuth client ID** → **Web application** →
+   authorized redirect URI: `https://deadline-buddy-one.vercel.app/oauth/callback`.
+6. Put the client ID and secret in `.env` **and** in Vercel as `GOOGLE_CLIENT_ID` and
+   `GOOGLE_CLIENT_SECRET`. Never commit them, never paste them in chat.
+7. Optional but recommended: on the consent screen, press **Publish app** (switch from
+   "Testing" to "In production"). See the next part for why.
 
-### The limits (important for a free student project)
+### The limits, and why "only me" makes them small
 
-- **Testing mode:** only the emails you list as test users can sign in, and the
-  **refresh tokens expire after 7 days**. Everyone would have to `/connect` again
-  every week.
-- **Publishing without verification:** refresh tokens stop expiring, but users see
-  a scary **"Google hasn't verified this app"** screen (they click Advanced → Go to
-  Deadline Buddy). Apps using sensitive scopes like calendar are capped at
-  **100 users** until verified.
-- **Verification** is free but slow. Google wants a privacy policy page, a home page,
-  a verified domain you own (a `vercel.app` address isn't yours), and sometimes a
-  demo video. It can take weeks.
-- **Google → bot direction:** to notice edits made in Google, you'd either use push
-  notifications (`events.watch`, which sends to a webhook and has to be renewed before
-  it expires) or check with a cron job. Vercel Hobby cron jobs run at most **once a
-  day**, so the cron way would be slow.
+- **Testing mode:** refresh tokens expire after **7 days**, so you'd need to `/connect`
+  again every week. Publishing the app (step 7) stops that.
+- **Published but unverified:** when you sign in, Google shows **"Google hasn't
+  verified this app"**. Since it's your own app, you click **Advanced → Go to Deadline
+  Buddy**. You see this once, when you connect.
+- **100-user cap** for unverified apps: irrelevant, there's one user (you).
+- **Verification** (privacy policy, owned domain, review): not needed for just you.
 
-For a group of friends, the ICS feed you have now gets most of the benefit with none
-of this hassle.
+## 23. The webhook secret, explained
 
-## 21. Ideas for later
+**The problem.** The bot's address `https://deadline-buddy-one.vercel.app/webhook` is
+public. Right now, anything that arrives there is believed. But anyone can send a
+message to a web address, not just Telegram. Someone who knew the address could send
+a fake update that says "I am chat 12345, delete task 57", and the bot would do it,
+because it can't tell a fake from the real Telegram.
 
-- **Webhook secret.** Right now anyone who knows your webhook URL could POST a fake
-  update. Telegram can send a secret header with every update: call `setWebhook` with
-  `secret_token=<random string>`, store the same string as `WEBHOOK_SECRET` in Vercel,
-  and reject requests where `request.headers.get("X-Telegram-Bot-Api-Secret-Token")`
-  doesn't match.
-- **Times, not just dates.** "call mom tomorrow 5pm" keeps "5pm" in the task text. A
-  `due_time` column plus timed calendar events would use it.
-- **Edit a task** (change its date) with another inline button.
+**The fix: a shared password.** When you register your webhook with Telegram (the
+`setWebhook` call), you can give it a `secret_token`. From then on, Telegram attaches
+that word to every real update, in a header called `X-Telegram-Bot-Api-Secret-Token`.
+The bot checks it:
+
+```python
+if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != os.getenv("WEBHOOK_SECRET"):
+    return "Not allowed", 401
+```
+
+Fakers don't know the word, so their updates are thrown away. It's the same idea as
+`CRON_SECRET` on `/cron/daily`, which you already have.
+
+**Why the order matters.** It needs three things: the code check, the `WEBHOOK_SECRET`
+env var in Vercel, and telling Telegram the word. If the code starts demanding the
+word before Telegram sends it, every **real** message gets rejected and the bot goes
+silent. Safe order:
+
+1. Deploy code that checks the word **only if `WEBHOOK_SECRET` is set**.
+2. Add `WEBHOOK_SECRET` in Vercel and redeploy.
+3. Call `setWebhook` with the same `secret_token`.
+4. Check `getWebhookInfo` shows no errors.
+
+## 24. Ideas for later
+
+- **A reminder at the exact time** ("call mom 5pm" → ping at 5 PM). Vercel Hobby cron
+  is once a day, but a free outside service like cron-job.org could call a
+  `/cron/soon` route every 5 minutes. (For you, Phase 3 gives this through Google's
+  alerts.)
+- **Repeating tasks** ("gym every monday").
+- **Snooze** a reminder to tomorrow with one tap.
