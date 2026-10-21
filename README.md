@@ -46,7 +46,6 @@ Vercel cron (00:00 UTC) ──GET /cron/daily──▶ Vercel ──▶ Telegram
 | `test_ics.py` | Checks the calendar feed is valid, using the `icalendar` package |
 | `fake_telegram.py` | Pretends to be Telegram for local testing |
 | `vercel.json` | The daily cron job |
-| `LEARNING.md` | Every concept used here, explained step by step |
 
 Database tables:
 
