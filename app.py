@@ -159,6 +159,51 @@ def add_task(cur, chat_id, text):
     return reply, [[{"text": "↩️ Undo", "callback_data": f"undo:{task_id}"}]]
 
 
+def short(task, size=28):
+    """Cut long task names so they fit on a button."""
+    return task if len(task) <= size else task[:size - 1] + "…"
+
+
+def list_view(cur, chat_id):
+    """The task list text plus one ✅ button per task. Used by /list and after a ✅ tap."""
+    cur.execute("SELECT id, task, due FROM tasks WHERE chat_id = %s ORDER BY due NULLS LAST, id", (chat_id,))
+    rows = cur.fetchall()
+    if not rows:
+        return "No tasks left 🎉\nJust type one, like: chem record friday", None
+
+    today = india_today()
+    lines = ["📋 Your tasks:", ""]
+    buttons = []
+    for number, (task_id, task, due) in enumerate(rows, start=1):
+        line = f"{number}. {task}"
+        if due:
+            line += f" — 📅 {nice_date(due)}"
+            if due < today:
+                line += " ⚠️"
+        lines.append(line)
+        if len(buttons) < 50:  # Telegram allows 100 buttons per message
+            # The button carries the real database id, not the list number.
+            buttons.append([{"text": f"✅ {number}. {short(task)}", "callback_data": f"done:{task_id}"}])
+    lines += ["", "Tap ✅ when you finish one."]
+    return "\n".join(lines)[:4000], buttons  # Telegram's limit is 4096 characters
+
+
+def reminder_view(rows, today):
+    """Morning reminder text and buttons for one user's (id, task, due) rows."""
+    lines = ["Good morning! ☀️ Here's what's due:", ""]
+    buttons = []
+    for task_id, task, due in rows:
+        if due < today:
+            label = "⚠️ Overdue"
+        elif due == today:
+            label = "🔥 Today"
+        else:
+            label = "⏰ Tomorrow"
+        lines.append(f"{label}: {task}")
+        buttons.append([{"text": f"✅ {short(task)}", "callback_data": f"rdone:{task_id}"}])
+    return "\n".join(lines)[:4000], buttons[:50]
+
+
 def handle_message(cur, chat_id, text):
     if text.lower().strip("!.? ") in GREETINGS:
         return "Hello buddy 👋 Just type a task, like: chem record friday"
@@ -176,19 +221,7 @@ def handle_message(cur, chat_id, text):
         return "Calendar is coming soon 📅"
 
     elif text in ["/list", BTN_LIST]:
-        cur.execute("SELECT task, due FROM tasks WHERE chat_id = %s ORDER BY due NULLS LAST, id", (chat_id,))
-        rows = cur.fetchall()
-        if not rows:
-            return "No tasks yet. Add one with /add"
-        reply = "Your tasks:\n"
-        count = 0
-        for row in rows:
-            count += 1
-            if row[1]:
-                reply += f"{count}. {row[0]} — 📅 {nice_date(row[1])}\n"
-            else:
-                reply += f"{count}. {row[0]}\n"
-        return reply
+        return list_view(cur, chat_id)
 
     elif text == "/doneall":
         cur.execute("SELECT COUNT(*) FROM tasks WHERE chat_id = %s", (chat_id,))
@@ -238,6 +271,26 @@ def handle_callback(cur, chat_id, data):
         if row is None:
             return "Already removed", None, None
         return "Undone ↩️", f"↩️ Removed: {row[0]}", None
+
+    if action in ("done", "rdone"):
+        cur.execute("DELETE FROM tasks WHERE id = %s AND chat_id = %s RETURNING task", (task_id, chat_id))
+        row = cur.fetchone()
+        popup = f"Done ✅ {short(row[0])}" if row else "Already done"
+
+        if action == "done":
+            # Tapped on the task list: show the list again, minus that task.
+            text, buttons = list_view(cur, chat_id)
+            return popup, text, buttons
+
+        # Tapped on the morning reminder: show the reminder again, minus that task.
+        today = india_today()
+        cur.execute("SELECT id, task, due FROM tasks WHERE chat_id = %s AND due <= %s ORDER BY due, id",
+                    (chat_id, today + timedelta(days=1)))
+        rows = cur.fetchall()
+        if not rows:
+            return popup, "All done for now 🎉 Nice work!", None
+        text, buttons = reminder_view(rows, today)
+        return popup, text, buttons
 
     return "This button is old. Send /list again 🙂", None, None
 
@@ -323,25 +376,22 @@ def daily_reminder():
     if not secret or request.headers.get("Authorization") != f"Bearer {secret}":
         return "Not allowed", 401
 
-    today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+    today = india_today()
 
     with connect() as conn:
         cur = conn.cursor()
-        cur.execute("SELECT chat_id, task, due FROM tasks WHERE due <= %s ORDER BY chat_id, due, id", (today + timedelta(days=1),))
+        cur.execute("SELECT chat_id, id, task, due FROM tasks WHERE due <= %s ORDER BY chat_id, due, id", (today + timedelta(days=1),))
         rows = cur.fetchall()
 
-    messages = {}
-    for chat_id, task, due in rows:
-        if due < today:
-            label = "⚠️ Overdue"
-        elif due == today:
-            label = "🔥 Today"
-        else:
-            label = "⏰ Tomorrow"
-        messages.setdefault(chat_id, []).append(f"{label}: {task}")
+    # Group the rows by user: {chat_id: [(id, task, due), ...]}
+    per_user = {}
+    for chat_id, task_id, task, due in rows:
+        per_user.setdefault(chat_id, []).append((task_id, task, due))
 
-    for chat_id, lines in messages.items():
-        text = "Good morning! ☀️ Here's what's due:\n\n" + "\n".join(lines)
-        tg("sendMessage", chat_id=chat_id, text=text)
+    for chat_id, user_rows in per_user.items():
+        text, buttons = reminder_view(user_rows, today)
+        tg("sendMessage", chat_id=chat_id, text=text, reply_markup={"inline_keyboard": buttons})
 
-    return f"Sent {len(messages)} reminders"
+    if DRY_RUN:
+        return jsonify(g.get("sent", []))
+    return f"Sent {len(per_user)} reminders"
