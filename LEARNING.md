@@ -1001,6 +1001,10 @@ silent. Safe order:
 3. Call `setWebhook` with the same `secret_token`.
 4. Check `getWebhookInfo` shows no errors.
 
+All four were done on 21 Oct 2026. Before step 3, the script checked that production
+answered **401** without the secret and **200** with it, so Telegram was only told once
+Vercel definitely had the same value.
+
 ## 24. Ideas for later
 
 - **A reminder at the exact time** ("call mom 5pm" → ping at 5 PM). Vercel Hobby cron

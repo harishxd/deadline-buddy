@@ -80,5 +80,9 @@ The local bot uses the real database, but `fake_telegram.py` uses a fake chat id
 ## Deploying
 
 `git push` to `main`. Vercel deploys automatically.
-Environment variables in Vercel: `BOT_TOKEN`, `DATABASE_URL`, `CRON_SECRET`
-(optional: `BASE_URL`, defaults to `https://deadline-buddy-one.vercel.app`).
+Environment variables in Vercel: `BOT_TOKEN`, `DATABASE_URL`, `CRON_SECRET`,
+`WEBHOOK_SECRET` (optional: `BASE_URL`, defaults to `https://deadline-buddy-one.vercel.app`).
+
+`WEBHOOK_SECRET` must be the same in `.env`, in Vercel, and in Telegram's webhook
+settings (`setWebhook` with `secret_token`). If you ever change it, update Vercel and
+redeploy first, then call `setWebhook` again.
