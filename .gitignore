@@ -1,3 +1,4 @@
 .env
 tasks.db
-__pycache__/LEARNING.md
+__pycache__/
+LEARNING.md
